@@ -3,7 +3,7 @@ import process from "node:process";
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || "http://localhost:8787";
 const SERVER_NAME = "chaoslab-orchestrator-mcp";
 const SERVER_VERSION = "0.1.0";
-const PROTOCOL_VERSION = "2024-11-05";
+const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 
 const toolSchemas = [
   {
@@ -81,14 +81,8 @@ const toolSchemas = [
   },
 ];
 
-function encodeMessage(message) {
-  const body = Buffer.from(JSON.stringify(message), "utf8");
-  const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "utf8");
-  return Buffer.concat([header, body]);
-}
-
 function sendMessage(message) {
-  process.stdout.write(encodeMessage(message));
+  process.stdout.write(`${JSON.stringify(message)}\n`);
 }
 
 function sendResult(id, result) {
@@ -192,10 +186,16 @@ async function handleRequest(message) {
   const { id, method, params } = message;
 
   if (method === "initialize") {
+    const requestedProtocolVersion =
+      typeof params?.protocolVersion === "string" && params.protocolVersion.trim()
+        ? params.protocolVersion.trim()
+        : DEFAULT_PROTOCOL_VERSION;
     sendResult(id, {
-      protocolVersion: PROTOCOL_VERSION,
+      protocolVersion: requestedProtocolVersion,
       capabilities: {
-        tools: {},
+        tools: {
+          listChanged: false,
+        },
       },
       serverInfo: {
         name: SERVER_NAME,
@@ -237,6 +237,10 @@ async function handleRequest(message) {
     return;
   }
 
+  if (method === "notifications/initialized") {
+    return;
+  }
+
   if (id !== undefined) {
     sendError(id, -32601, `Method not found: ${method}`);
   }
@@ -257,58 +261,42 @@ async function handleMessage(message) {
   }
 }
 
-let buffer = Buffer.alloc(0);
+let lineBuffer = "";
 
-function parseHeaders(headerText) {
-  const lines = headerText.split("\r\n");
-  const headers = {};
-  for (const line of lines) {
-    const index = line.indexOf(":");
-    if (index === -1) {
-      continue;
-    }
-    const key = line.slice(0, index).trim().toLowerCase();
-    const value = line.slice(index + 1).trim();
-    headers[key] = value;
-  }
-  return headers;
-}
-
-async function processBuffer() {
+async function processLines() {
   while (true) {
-    const headerEnd = buffer.indexOf("\r\n\r\n");
-    if (headerEnd === -1) {
+    const newlineIndex = lineBuffer.indexOf("\n");
+    if (newlineIndex === -1) {
       return;
     }
-    const headerText = buffer.slice(0, headerEnd).toString("utf8");
-    const headers = parseHeaders(headerText);
-    const contentLength = Number(headers["content-length"]);
-    if (!Number.isFinite(contentLength) || contentLength < 0) {
-      buffer = buffer.slice(headerEnd + 4);
+    const rawLine = lineBuffer.slice(0, newlineIndex);
+    lineBuffer = lineBuffer.slice(newlineIndex + 1);
+    const line = rawLine.trim();
+    if (!line) {
       continue;
     }
-    const messageStart = headerEnd + 4;
-    const totalNeeded = messageStart + contentLength;
-    if (buffer.length < totalNeeded) {
-      return;
-    }
-    const bodyBuffer = buffer.slice(messageStart, totalNeeded);
-    buffer = buffer.slice(totalNeeded);
-
-    let message;
+    let parsed;
     try {
-      message = JSON.parse(bodyBuffer.toString("utf8"));
+      parsed = JSON.parse(line);
     } catch {
       continue;
     }
-    await handleMessage(message);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        // Keep lifecycle ordering stable even in batches.
+        await handleMessage(item);
+      }
+      continue;
+    }
+    await handleMessage(parsed);
   }
 }
 
+process.stdin.setEncoding("utf8");
 process.stdin.on("data", async (chunk) => {
-  buffer = Buffer.concat([buffer, chunk]);
+  lineBuffer += chunk;
   try {
-    await processBuffer();
+    await processLines();
   } catch (error) {
     console.error(`[${SERVER_NAME}]`, error);
   }
