@@ -985,123 +985,306 @@ app.get("/ui/runtime", (_, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ChaosLab Runtime Preview</title>
   <style>
-    body { margin: 0; font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #070b14; color: #e5eeff; }
-    main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+    body { margin: 0; font-family: "Avenir Next", "Segoe UI", sans-serif; background: radial-gradient(circle at 12% 10%, #1f3454 0%, #091224 45%, #050a15 100%); color: #e5eeff; }
+    main { max-width: 1200px; margin: 0 auto; padding: 20px; }
     h1 { margin: 0 0 8px; }
     p { color: #9cadc9; }
-    .card { background: #0f1727; border: 1px solid #233452; border-radius: 12px; padding: 14px; margin-top: 14px; }
+    .card { background: rgba(14, 24, 40, 0.84); border: 1px solid #28456f; border-radius: 12px; padding: 14px; margin-top: 14px; box-shadow: 0 18px 32px rgba(0,0,0,0.3); }
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     button { background: #9fe870; color: #07120a; border: none; border-radius: 10px; padding: 10px 12px; font-weight: 700; cursor: pointer; }
     button.secondary { background: #314160; color: #e5eeff; }
+    button.accent { background: #62d8ff; color: #062035; }
     .muted { color: #9cadc9; font-size: 13px; }
-    canvas { width: 100%; background: linear-gradient(180deg, #0f1b2f, #0a1322); border-radius: 12px; display: block; }
+    #sceneWrap { position: relative; width: 100%; height: min(68vh, 720px); min-height: 420px; border-radius: 12px; overflow: hidden; background: linear-gradient(180deg, #1a2f4a, #091224); border: 1px solid #2c4d79; }
+    #world3d { width: 100%; height: 100%; display: block; }
+    #labelLayer { position: absolute; inset: 0; pointer-events: none; }
+    .actorLabel {
+      position: absolute;
+      transform: translate(-50%, -100%);
+      background: rgba(0, 0, 0, 0.58);
+      border: 1px solid rgba(148, 213, 255, 0.45);
+      color: #e8f4ff;
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 12px;
+      white-space: nowrap;
+      backdrop-filter: blur(2px);
+    }
+    .chatBubble {
+      position: absolute;
+      transform: translate(-50%, -130%);
+      background: rgba(255, 254, 228, 0.95);
+      color: #12243c;
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 12px;
+      border: 1px solid rgba(18, 36, 60, 0.28);
+      max-width: 260px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     ul { margin: 8px 0 0; padding-left: 16px; }
     code { background: #1a2b45; border-radius: 6px; padding: 1px 5px; }
+    .status { min-height: 18px; color: #9dd2ff; }
   </style>
 </head>
 <body>
   <main>
-    <h1>Runtime Preview (Virtual Open World)</h1>
-    <p>Spawn your active model character and preview live move/chat behavior from orchestrator commands.</p>
+    <h1>Runtime Preview (3D Open World)</h1>
+    <p>Spawn real uploaded models, stream AI commands, and watch movement/chat with VFX in a live 3D world.</p>
     <section class="card">
       <div class="row">
         <button id="startSession">Start Runtime Session</button>
         <button id="spawnActive" class="secondary">Spawn Active Character</button>
         <button id="autoMove" class="secondary">Auto Move + Chat (demo)</button>
+        <button id="focusActor" class="accent">Focus Active Actor</button>
       </div>
       <p id="sessionInfo" class="muted">Session: not started</p>
+      <p id="runtimeStatus" class="status"></p>
       <p class="muted">Copilot/MCP should read <code>/api/mcp/context</code> and send <code>spawn</code>, <code>move_to</code>, <code>say</code> to <code>/control/:sessionId</code>.</p>
     </section>
     <section class="card">
-      <canvas id="world" width="980" height="520"></canvas>
-      <p class="muted">Top-down world. X/Z mapped into canvas. Circles are actors; labels and chat bubbles update live.</p>
+      <div id="sceneWrap">
+        <canvas id="world3d"></canvas>
+        <div id="labelLayer"></div>
+      </div>
+      <p class="muted">Glow ring + movement trail + floating labels are rendered for each actor.</p>
     </section>
     <section class="card">
       <h3>Recent Chats</h3>
       <ul id="chatList"></ul>
     </section>
   </main>
-  <script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.166.1/build/three.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.166.1/build/three.module.js";
+    import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/controls/OrbitControls.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/loaders/GLTFLoader.js";
+    window.__runtimeModuleLoaded = true;
+
     const startSessionBtn = document.getElementById("startSession");
     const spawnActiveBtn = document.getElementById("spawnActive");
     const autoMoveBtn = document.getElementById("autoMove");
+    const focusActorBtn = document.getElementById("focusActor");
     const sessionInfo = document.getElementById("sessionInfo");
-    const canvas = document.getElementById("world");
-    const ctx = canvas.getContext("2d");
+    const runtimeStatus = document.getElementById("runtimeStatus");
+    const canvas = document.getElementById("world3d");
+    const sceneWrap = document.getElementById("sceneWrap");
+    const labelLayer = document.getElementById("labelLayer");
     const chatList = document.getElementById("chatList");
 
     let sessionId = "";
     let worldState = { actors: [], chats: [] };
     let pollingTimer = null;
     let autoTimer = null;
+    let activeContext = null;
 
-    const colorFor = (id) => {
-      let hash = 0;
-      for (let i = 0; i < id.length; i++) {
-        hash = ((hash << 5) - hash) + id.charCodeAt(i);
-        hash |= 0;
-      }
-      const hue = Math.abs(hash) % 360;
-      return "hsl(" + hue + ", 72%, 60%)";
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0x0c1729, 12, 48);
+
+    const camera = new THREE.PerspectiveCamera(56, 16 / 9, 0.1, 120);
+    camera.position.set(8, 7, 8);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.3, 0);
+    controls.enableDamping = true;
+    controls.maxPolarAngle = Math.PI * 0.48;
+    controls.minDistance = 3;
+    controls.maxDistance = 30;
+
+    const hemi = new THREE.HemisphereLight(0x8fc8ff, 0x0a1120, 0.9);
+    scene.add(hemi);
+    const key = new THREE.DirectionalLight(0xffffff, 1.4);
+    key.position.set(6, 14, 8);
+    key.castShadow = false;
+    scene.add(key);
+
+    const ground = new THREE.Mesh(
+      new THREE.CircleGeometry(22, 96),
+      new THREE.MeshStandardMaterial({
+        color: 0x0f2137,
+        metalness: 0.1,
+        roughness: 0.9,
+        emissive: 0x072244,
+        emissiveIntensity: 0.36,
+      }),
+    );
+    ground.rotation.x = -Math.PI / 2;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(40, 40, 0x4ca4ff, 0x1f4268);
+    grid.position.y = 0.005;
+    grid.material.opacity = 0.35;
+    grid.material.transparent = true;
+    scene.add(grid);
+
+    const loader = new GLTFLoader();
+    const modelCache = new Map();
+    const actorEntities = new Map();
+    const pointer = new THREE.Vector3();
+
+    const setStatus = (text, isError = false) => {
+      runtimeStatus.textContent = text;
+      runtimeStatus.style.color = isError ? "#ff9da4" : "#9dd2ff";
     };
 
-    const worldToCanvas = (position) => {
-      const x = Number(position?.[0] || 0);
-      const z = Number(position?.[2] || 0);
-      const scale = 55;
+    const toVec3 = (pos) => {
+      const x = Number(pos?.[0] || 0);
+      const y = Number(pos?.[1] || 0);
+      const z = Number(pos?.[2] || 0);
+      return new THREE.Vector3(x, y, z);
+    };
+
+    const fitModelToHeight = (object3d, targetHeight) => {
+      const box = new THREE.Box3().setFromObject(object3d);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      if (size.y <= 0.0001) return;
+      const scale = targetHeight / size.y;
+      object3d.scale.multiplyScalar(scale);
+      const boxAfter = new THREE.Box3().setFromObject(object3d);
+      const minY = boxAfter.min.y;
+      object3d.position.y += (0.02 - minY);
+    };
+
+    const createFallbackBody = () => {
+      const group = new THREE.Group();
+      const body = new THREE.Mesh(
+        new THREE.CapsuleGeometry(0.28, 1.0, 4, 10),
+        new THREE.MeshStandardMaterial({
+          color: 0x7ec8ff,
+          emissive: 0x114677,
+          emissiveIntensity: 0.36,
+          roughness: 0.34,
+          metalness: 0.24,
+        }),
+      );
+      body.position.y = 0.8;
+      group.add(body);
+      return group;
+    };
+
+    const createGlowRing = () => {
+      const ring = new THREE.Mesh(
+        new THREE.RingGeometry(0.45, 0.62, 28),
+        new THREE.MeshBasicMaterial({
+          color: 0x7de3ff,
+          transparent: true,
+          opacity: 0.72,
+          side: THREE.DoubleSide,
+        }),
+      );
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.y = 0.03;
+      return ring;
+    };
+
+    const createTrail = () => {
+      const points = [];
+      for (let i = 0; i < 18; i += 1) points.push(new THREE.Vector3(0, 0.04, 0));
+      const geometry = new THREE.BufferGeometry().setFromPoints(points);
+      const material = new THREE.LineBasicMaterial({ color: 0x8fe8ff, transparent: true, opacity: 0.52 });
+      const line = new THREE.Line(geometry, material);
+      line.frustumCulled = false;
+      return { line, points };
+    };
+
+    const loadModelObject = async (modelName) => {
+      if (!modelName) {
+        return createFallbackBody();
+      }
+      const url = "/assets/models/" + encodeURIComponent(modelName);
+      const ext = modelName.split(".").pop()?.toLowerCase() || "";
+      if (ext !== "glb" && ext !== "gltf") {
+        return createFallbackBody();
+      }
+      if (!modelCache.has(modelName)) {
+        modelCache.set(
+          modelName,
+          new Promise((resolve) => {
+            loader.load(
+              url,
+              (gltf) => resolve(gltf.scene || createFallbackBody()),
+              undefined,
+              () => resolve(createFallbackBody()),
+            );
+          }),
+        );
+      }
+      const src = await modelCache.get(modelName);
+      return src.clone(true);
+    };
+
+    const createActorEntity = async (actor) => {
+      const root = new THREE.Group();
+      const model = await loadModelObject(actor.modelName);
+      fitModelToHeight(model, 1.8);
+      root.add(model);
+
+      const glow = createGlowRing();
+      root.add(glow);
+
+      const trail = createTrail();
+      scene.add(trail.line);
+      scene.add(root);
+
+      const label = document.createElement("div");
+      label.className = "actorLabel";
+      labelLayer.appendChild(label);
+
+      const chat = document.createElement("div");
+      chat.className = "chatBubble";
+      chat.style.display = "none";
+      labelLayer.appendChild(chat);
+
+      root.position.copy(toVec3(actor.position));
       return {
-        x: canvas.width / 2 + x * scale,
-        y: canvas.height / 2 + z * scale,
+        actorId: actor.actorId,
+        root,
+        model,
+        glow,
+        trail,
+        label,
+        chat,
+        targetPosition: toVec3(actor.position),
+        lastChat: "",
+        chatExpiresAt: 0,
       };
     };
 
-    const drawGrid = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.strokeStyle = "#1c2a43";
-      ctx.lineWidth = 1;
-      for (let x = 0; x <= canvas.width; x += 40) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, canvas.height);
-        ctx.stroke();
-      }
-      for (let y = 0; y <= canvas.height; y += 40) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(canvas.width, y);
-        ctx.stroke();
-      }
-      ctx.strokeStyle = "#35507a";
-      ctx.beginPath();
-      ctx.moveTo(canvas.width / 2, 0);
-      ctx.lineTo(canvas.width / 2, canvas.height);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(0, canvas.height / 2);
-      ctx.lineTo(canvas.width, canvas.height / 2);
-      ctx.stroke();
+    const updateLabel = (entity, actor) => {
+      entity.label.textContent = (actor.name || actor.actorId) + " · " + (actor.role || "actor");
     };
 
-    const drawActors = () => {
-      worldState.actors.forEach((actor) => {
-        const p = worldToCanvas(actor.position);
-        ctx.fillStyle = colorFor(actor.actorId);
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 16, 0, Math.PI * 2);
-        ctx.fill();
+    const showChat = (entity, text) => {
+      entity.chat.textContent = text;
+      entity.chat.style.display = "block";
+      entity.chatExpiresAt = performance.now() + 3600;
+    };
 
-        ctx.fillStyle = "#e6f0ff";
-        ctx.font = "12px ui-sans-serif, system-ui";
-        ctx.fillText((actor.name || actor.actorId) + " [" + actor.actorId + "]", p.x + 20, p.y - 6);
-        if (actor.role) {
-          ctx.fillStyle = "#9cadc9";
-          ctx.fillText(actor.role, p.x + 20, p.y + 11);
-        }
-        if (actor.lastChat) {
-          ctx.fillStyle = "#f6ffb4";
-          ctx.fillText('"' + actor.lastChat.slice(0, 42) + '"', p.x + 20, p.y + 28);
-        }
-      });
+    const updateTrail = (entity) => {
+      entity.trail.points.unshift(entity.root.position.clone().setY(0.04));
+      entity.trail.points.pop();
+      entity.trail.line.geometry.setFromPoints(entity.trail.points);
+    };
+
+    const projectToScreen = (worldPos) => {
+      pointer.copy(worldPos);
+      pointer.project(camera);
+      return {
+        x: (pointer.x * 0.5 + 0.5) * sceneWrap.clientWidth,
+        y: (-pointer.y * 0.5 + 0.5) * sceneWrap.clientHeight,
+        visible: pointer.z < 1,
+      };
     };
 
     const renderChats = () => {
@@ -1118,20 +1301,89 @@ app.get("/ui/runtime", (_, res) => {
       });
     };
 
-    const render = () => {
-      drawGrid();
-      drawActors();
+    const syncActors = async () => {
+      const nextIds = new Set();
+      for (const actor of worldState.actors || []) {
+        if (!actor?.actorId) continue;
+        nextIds.add(actor.actorId);
+        let entity = actorEntities.get(actor.actorId);
+        if (!entity) {
+          entity = await createActorEntity(actor);
+          actorEntities.set(actor.actorId, entity);
+        }
+        entity.targetPosition.copy(toVec3(actor.position));
+        updateLabel(entity, actor);
+        if (actor.lastChat && actor.lastChat !== entity.lastChat) {
+          entity.lastChat = actor.lastChat;
+          showChat(entity, actor.lastChat);
+        }
+      }
+      for (const [actorId, entity] of actorEntities.entries()) {
+        if (nextIds.has(actorId)) continue;
+        scene.remove(entity.root);
+        scene.remove(entity.trail.line);
+        entity.label.remove();
+        entity.chat.remove();
+        actorEntities.delete(actorId);
+      }
       renderChats();
+    };
+
+    const resizeRenderer = () => {
+      const w = Math.max(sceneWrap.clientWidth, 320);
+      const h = Math.max(sceneWrap.clientHeight, 320);
+      renderer.setSize(w, h, false);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    };
+
+    const animate = () => {
+      requestAnimationFrame(animate);
+      const t = performance.now() * 0.001;
+      controls.update();
+
+      for (const entity of actorEntities.values()) {
+        entity.root.position.lerp(entity.targetPosition, 0.1);
+        const dir = entity.targetPosition.clone().sub(entity.root.position);
+        if (dir.lengthSq() > 0.001) {
+          entity.root.rotation.y = Math.atan2(dir.x, dir.z);
+        }
+        entity.glow.material.opacity = 0.5 + Math.sin(t * 4.2) * 0.2;
+        entity.glow.scale.setScalar(1 + Math.sin(t * 3.0) * 0.05);
+        updateTrail(entity);
+
+        const p = projectToScreen(entity.root.position.clone().add(new THREE.Vector3(0, 2.0, 0)));
+        if (p.visible) {
+          entity.label.style.display = "block";
+          entity.label.style.left = p.x + "px";
+          entity.label.style.top = p.y + "px";
+          if (entity.chat.style.display !== "none") {
+            entity.chat.style.left = p.x + "px";
+            entity.chat.style.top = (p.y - 28) + "px";
+          }
+        } else {
+          entity.label.style.display = "none";
+          entity.chat.style.display = "none";
+        }
+        if (entity.chatExpiresAt && performance.now() > entity.chatExpiresAt) {
+          entity.chat.style.display = "none";
+          entity.chatExpiresAt = 0;
+        }
+      }
+
+      renderer.render(scene, camera);
     };
 
     const loadWorld = async () => {
       if (!sessionId) return;
       const response = await fetch("/api/world?sessionId=" + encodeURIComponent(sessionId));
       const data = await response.json();
-      if (response.ok) {
-        worldState = data;
-        render();
+      if (!response.ok) {
+        setStatus("Failed to load world: " + (data.error || "unknown"), true);
+        return;
       }
+      worldState = data;
+      await syncActors();
     };
 
     const startPolling = () => {
@@ -1159,10 +1411,12 @@ app.get("/ui/runtime", (_, res) => {
       const data = await response.json();
       if (!response.ok) {
         sessionInfo.textContent = "Failed to start session.";
+        setStatus(data.error || "Cannot start runtime session.", true);
         return;
       }
       sessionId = data.sessionId;
       sessionInfo.textContent = "Session: " + sessionId;
+      setStatus("Runtime session started.");
       startPolling();
       await loadWorld();
     });
@@ -1180,9 +1434,12 @@ app.get("/ui/runtime", (_, res) => {
       const data = await response.json();
       if (!response.ok) {
         sessionInfo.textContent = "Spawn failed: " + (data.error || "unknown");
+        setStatus(data.error || "Spawn failed.", true);
         return;
       }
       sessionInfo.textContent = "Spawned active character in session " + sessionId;
+      activeContext = data.scene || activeContext;
+      setStatus("Active model spawned into 3D world.");
       await loadWorld();
     });
 
@@ -1194,17 +1451,21 @@ app.get("/ui/runtime", (_, res) => {
       const contextResponse = await fetch("/api/mcp/context");
       const context = await contextResponse.json();
       const actorId = context?.scene?.activeCharacter?.actorId;
+      activeContext = context;
       if (!actorId) {
         sessionInfo.textContent = "Set active character in /ui/models first.";
+        setStatus("No active character found.", true);
         return;
       }
       if (autoTimer) {
         clearInterval(autoTimer);
         autoTimer = null;
         autoMoveBtn.textContent = "Auto Move + Chat (demo)";
+        setStatus("Auto demo stopped.");
         return;
       }
       autoMoveBtn.textContent = "Stop Auto Demo";
+      setStatus("Auto demo running.");
       autoTimer = setInterval(async () => {
         const x = (Math.random() * 8) - 4;
         const z = (Math.random() * 8) - 4;
@@ -1221,7 +1482,81 @@ app.get("/ui/runtime", (_, res) => {
       }, 2200);
     });
 
-    render();
+    focusActorBtn.addEventListener("click", () => {
+      const actorId = activeContext?.scene?.activeCharacter?.actorId;
+      if (!actorId || !actorEntities.has(actorId)) {
+        setStatus("No spawned active actor to focus.", true);
+        return;
+      }
+      const target = actorEntities.get(actorId).root.position;
+      controls.target.copy(target.clone().add(new THREE.Vector3(0, 1.2, 0)));
+      camera.position.copy(target.clone().add(new THREE.Vector3(3.5, 3.2, 3.5)));
+      setStatus("Camera focused on active actor.");
+    });
+
+    window.addEventListener("resize", resizeRenderer);
+    resizeRenderer();
+    animate();
+    setStatus("3D world ready.");
+  </script>
+  <script>
+    (function () {
+      let fallbackSessionId = "";
+      setTimeout(function () {
+        if (window.__runtimeModuleLoaded) {
+          return;
+        }
+        const startBtn = document.getElementById("startSession");
+        const spawnBtn = document.getElementById("spawnActive");
+        const sessionInfo = document.getElementById("sessionInfo");
+        const status = document.getElementById("runtimeStatus");
+        status.textContent = "3D engine failed to load (CDN/module blocked). Fallback controls are active.";
+        status.style.color = "#ffb870";
+        const layer = document.getElementById("labelLayer");
+        if (layer) {
+          layer.innerHTML = '<div class="actorLabel" style="left:50%;top:52%;transform:translate(-50%,-50%);display:block;">3D renderer failed to load. Check browser console/network and disable blockers for localhost.</div>';
+        }
+
+        startBtn.addEventListener("click", async function () {
+          const response = await fetch("/session/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ deviceId: "runtime-preview-fallback" }),
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            status.textContent = "Fallback start failed: " + (data.error || "unknown");
+            status.style.color = "#ff9da4";
+            return;
+          }
+          fallbackSessionId = data.sessionId;
+          sessionInfo.textContent = "Session: " + fallbackSessionId;
+          status.textContent = "Fallback session started.";
+          status.style.color = "#9dd2ff";
+        });
+
+        spawnBtn.addEventListener("click", async function () {
+          if (!fallbackSessionId) {
+            status.textContent = "Start session first.";
+            status.style.color = "#ff9da4";
+            return;
+          }
+          const response = await fetch("/api/scene/spawn/" + encodeURIComponent(fallbackSessionId), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ position: [0, 0, 0] }),
+          });
+          const data = await response.json();
+          if (!response.ok) {
+            status.textContent = "Fallback spawn failed: " + (data.error || "unknown");
+            status.style.color = "#ff9da4";
+            return;
+          }
+          status.textContent = "Fallback spawn sent.";
+          status.style.color = "#9dd2ff";
+        });
+      }, 1200);
+    })();
   </script>
 </body>
 </html>`);
