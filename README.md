@@ -1,184 +1,172 @@
-# ChaosLab AI AR Pilot
+# ChaosLab AI Orchestrator + MCP Preview
 
-iOS-first AR pilot scaffold with:
-- an HTTP orchestrator server
-- an Expo mobile client
-- an MCP-friendly control endpoint for injecting commands
+Step-by-step guide to:
+1. set up a 3D model entity
+2. assign character role/persona
+3. connect via GitHub Copilot MCP
+4. see it spawn/move/chat in preview world
 
-## Project structure
+## What This Repo Contains
 
-- `services/orchestrator` - Express server for sessions, events, command polling, and command injection.
-- `apps/mobile-expo` - Expo app that starts a session, polls commands, and sends ACKs.
-- `docs/http-api.md` - MVP API contract.
+- `services/orchestrator` - HTTP server (models, characters, sessions, commands, runtime world state).
+- `services/orchestrator-mcp` - local MCP bridge server for Copilot.
+- `services/mcp-agent` - optional autonomous worker (not required for Copilot MCP flow).
+- `apps/mobile-expo` - mobile client scaffold for later iOS camera/AR integration.
 
 ## Prerequisites
 
 - Node.js 18+
-- npm 9+
-- Xcode + iOS Simulator (for local iOS testing)
-- Optional: Expo Go on iPhone (same Wi-Fi as your dev machine)
+- pnpm
+- VS Code with GitHub Copilot Chat + MCP enabled
 
-## 1) Start the orchestrator server
+## Quick Start (Full Flow)
+
+### 1) Install dependencies
 
 From repo root:
 
 ```bash
-npm install
-npm run dev:server
+pnpm install
 ```
 
-Expected output:
-
-```text
-Orchestrator server running on http://localhost:8787
-```
-
-Quick health check in another terminal:
-
-```bash
-curl http://localhost:8787/health
-```
-
-You should see JSON like:
-
-```json
-{"ok":true,"sessions":0}
-```
-
-## 2) Start the Expo app
-
-In a new terminal (from repo root):
-
-```bash
-npm run dev:mobile
-```
-
-Then:
-- press `i` to launch iOS Simulator, or
-- scan the QR code with Expo Go on your iPhone.
-
-Inside the app:
-1. In `Server URL`, set your orchestrator URL.
-2. Tap `Start Session`.
-3. Confirm a `Session ID` appears.
-
-### Which Server URL should you use?
-
-- iOS Simulator on same Mac: `http://localhost:8787`
-- Physical iPhone: `http://<YOUR_MAC_LAN_IP>:8787` (example: `http://192.168.1.25:8787`)
-
-If testing on phone, make sure:
-- phone + Mac are on same network
-- macOS firewall allows Node incoming connections
-
-## 3) Connect using MCP (command injection flow)
-
-The orchestrator already exposes an MCP-bridge-friendly endpoint:
-
-- `POST /control/:sessionId`
-
-### Manual smoke test (no bridge yet)
-
-After the app session is started, copy the shown `Session ID` and run:
-
-```bash
-curl -X POST "http://localhost:8787/control/<SESSION_ID>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "say",
-    "payload": {
-      "actorId": "npc-1",
-      "text": "hello from control"
-    }
-  }'
-```
-
-The command should appear in the Expo app under `Latest Commands`.
-
-### Hooking an MCP bridge
-
-Your MCP bridge service should:
-1. Receive tool output or agent decisions.
-2. Map those into your command schema (`type` + `payload`).
-3. POST commands to `/control/:sessionId`.
-
-Minimal bridge target example:
-
-```text
-POST http://<orchestrator-host>:8787/control/<sessionId>
-Content-Type: application/json
-{
-  "type": "move_to",
-  "payload": {
-    "actorId": "npc-1",
-    "position": [0.2, 0.0, -1.2],
-    "speed": 1.2
-  }
-}
-```
-
-For full request/response details, see [`docs/http-api.md`](docs/http-api.md).
-
-## 4) Autonomous MCP Agent (Copilot bridge scaffold)
-
-This repo now includes a minimal autonomous worker:
-
-- `services/mcp-agent`
-
-What it does:
-1. starts (or reuses) a session
-2. reads role context from `GET /api/mcp/context`
-3. auto-spawns the active character (if needed)
-4. continuously sends `move_to` + periodic `say` commands to `/control/:sessionId`
-
-### Setup order
-
-1. Start orchestrator:
+### 2) Start orchestrator
 
 ```bash
 pnpm run dev:server
 ```
 
-2. Open model manager and set active character:
+Open:
+- [http://localhost:8787](http://localhost:8787)
 
-```text
-http://localhost:8787/ui/models
+### 3) Set up 3D model entity
+
+Open:
+- [http://localhost:8787/ui/models](http://localhost:8787/ui/models)
+
+Do this in order:
+1. Upload your model file (`.glb`, `.gltf`, `.usdz`, `.usdc`, `.obj`, `.fbx`)
+2. In **Character Builder**, choose that model
+3. Fill:
+   - `Character ID`
+   - `Actor ID` (used in command payloads)
+   - `Name`
+   - `Role`
+   - `Voice Style`
+   - `Bio / Guidance`
+4. Click **Save Character**
+5. In **Active Scene Context**, set:
+   - `Active Model`
+   - `Active Character`
+6. Click **Save Active Scene**
+
+This creates live context used by MCP at:
+- `GET /api/mcp/context`
+
+### 4) Configure Copilot MCP in VS Code
+
+This workspace already includes:
+- `.vscode/mcp.json`
+
+Current config:
+
+```json
+{
+  "servers": {
+    "chaoslab-orchestrator": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["services/orchestrator-mcp/src/server.js"],
+      "env": {
+        "ORCHESTRATOR_URL": "http://localhost:8787"
+      }
+    }
+  }
+}
 ```
 
-3. (Optional) Open runtime preview:
+In VS Code:
+1. Open this repo folder
+2. Ensure Copilot MCP is enabled
+3. Reload window if MCP server is not detected
+
+### 5) Start preview world
+
+Open:
+- [http://localhost:8787/ui/runtime](http://localhost:8787/ui/runtime)
+
+Click:
+1. **Start Runtime Session**
+2. **Spawn Active Character**
+
+You now have a live session ID in runtime preview.
+
+### 6) Drive it through Copilot MCP
+
+In Copilot Chat, ask it to use MCP tools in this order:
+1. `get_context`
+2. `start_session` (or reuse runtime session)
+3. `spawn_active`
+4. repeated `send_command` with `move_to` and `say`
+5. `get_world` to verify actor state/chat history
+
+Available MCP tools:
+- `get_context`
+- `start_session`
+- `spawn_active`
+- `send_command`
+- `get_world`
+- `list_models`
+
+## Recommended Copilot Prompt
+
+Use this in Copilot Chat:
 
 ```text
-http://localhost:8787/ui/runtime
+Use the chaoslab-orchestrator MCP tools.
+1) Get context.
+2) Start a session.
+3) Spawn active character.
+4) Enter a loop: send move_to and say commands in character.
+5) Check get_world after each cycle and adapt behavior.
 ```
 
-4. Start autonomous agent:
+## APIs (Core)
+
+- `GET /api/models` - models + characters + active scene
+- `POST /api/models/upload` - upload model binary
+- `POST /api/models/:modelName/characters` - add/update character
+- `PUT /api/scene` - set active model/character
+- `GET /api/mcp/context` - role context for AI
+- `POST /session/start` - create session
+- `POST /control/:sessionId` - send command (`spawn`, `move_to`, `say`)
+- `POST /api/scene/spawn/:sessionId` - spawn active scene character
+- `GET /api/world?sessionId=...` - runtime world state
+
+## Optional: Autonomous Local Agent (No Copilot)
+
+If you want local auto-behavior without Copilot:
 
 ```bash
 pnpm run dev:agent
 ```
 
-### Useful env vars
-
-- `ORCHESTRATOR_URL` (default: `http://localhost:8787`)
-- `SESSION_ID` (reuse an existing session)
-- `TICK_MS` (default: `3000`)
-- `CHAT_EVERY_N_TICKS` (default: `3`)
-- `AUTO_SPAWN` (`false` disables spawn helper)
-- `MOVE_RADIUS` (default: `4`)
+Useful env vars:
+- `ORCHESTRATOR_URL`
+- `SESSION_ID`
+- `TICK_MS`
+- `CHAT_EVERY_N_TICKS`
+- `AUTO_SPAWN`
+- `MOVE_RADIUS`
 
 ## Troubleshooting
 
-- `npm install` fails:
-  - check registry/network access
-  - retry with `npm config get registry` and verify it points to npmjs
-- Expo app cannot reach server from phone:
-  - use Mac LAN IP instead of `localhost`
-  - confirm server is running on port `8787`
-- `Missing or invalid session` errors:
-  - start session from app first and use the newest `Session ID`
-
-## Next steps
-
-1. Add a real MCP bridge worker (tool output -> safe command schema).
-2. Add auth between mobile app, orchestrator, and bridge.
-3. Add persistence (Redis/Postgres) for production-ready command history and session state.
+- `EADDRINUSE: 8787`:
+  - another server is already running on port `8787`; stop it and retry.
+- MCP tools not visible in Copilot:
+  - confirm `.vscode/mcp.json` exists
+  - reload VS Code window
+  - keep `pnpm run dev:server` running
+- `No active model/character selected`:
+  - set and save active scene in `/ui/models` first.
+- Runtime page is empty:
+  - click **Start Runtime Session** and **Spawn Active Character**.

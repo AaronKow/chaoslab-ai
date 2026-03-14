@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "chaoslab-orchestrator": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["services/orchestrator-mcp/src/server.js"],
+      "env": {
+        "ORCHESTRATOR_URL": "http://localhost:8787"
+      }
+    }
+  }
+}
