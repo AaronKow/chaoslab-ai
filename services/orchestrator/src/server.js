@@ -534,6 +534,84 @@ app.post("/api/models/upload", express.raw({ type: "application/octet-stream", l
   }
 });
 
+app.put("/api/models/:modelName/replace", express.raw({ type: "application/octet-stream", limit: "500mb" }), async (req, res) => {
+  try {
+    const modelName = req.params.modelName;
+    const models = await listModels();
+    const existing = models.find((model) => model.name === modelName);
+    if (!existing) {
+      return res.status(404).json({ error: `Model not found: ${modelName}` });
+    }
+    if (!req.body || !Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ error: "Upload body is empty" });
+    }
+
+    const incomingName = req.header("x-filename");
+    if (incomingName && typeof incomingName === "string") {
+      const incomingExt = path.extname(incomingName).toLowerCase();
+      const existingExt = path.extname(modelName).toLowerCase();
+      if (incomingExt && incomingExt !== existingExt) {
+        return res.status(400).json({
+          error: `File extension mismatch. Existing model is ${existingExt}, incoming file is ${incomingExt}.`,
+        });
+      }
+    }
+
+    const fullPath = path.join(MODELS_DIR, modelName);
+    await fsp.writeFile(fullPath, req.body);
+    const stats = await fsp.stat(fullPath);
+    const ext = path.extname(modelName).toLowerCase();
+    res.status(202).json({
+      replaced: {
+        name: modelName,
+        extension: ext,
+        sizeBytes: stats.size,
+        updatedAt: stats.mtimeMs,
+        url: `${PUBLIC_MODELS_PATH}/${encodeURIComponent(modelName)}`,
+        projectPath: path.relative(REPO_ROOT, fullPath),
+        previewable: ext === ".glb" || ext === ".gltf",
+      },
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message || "Replace failed" });
+  }
+});
+
+app.delete("/api/models/:modelName", async (req, res) => {
+  try {
+    const modelName = req.params.modelName;
+    const fullPath = path.join(MODELS_DIR, modelName);
+    const ext = path.extname(modelName).toLowerCase();
+    if (!ALLOWED_MODEL_EXTENSIONS.has(ext)) {
+      return res.status(400).json({ error: `Unsupported model extension: ${ext || "unknown"}` });
+    }
+
+    await fsp.unlink(fullPath);
+
+    const registry = await readCharacterRegistry();
+    if (registry[modelName]) {
+      delete registry[modelName];
+      await writeJsonFile(CHARACTERS_PATH, registry);
+    }
+
+    const sceneState = await readSceneState();
+    if (sceneState.activeModel === modelName) {
+      await writeJsonFile(SCENE_STATE_PATH, {
+        activeModel: "",
+        activeCharacterId: "",
+        updatedAt: now(),
+      });
+    }
+
+    res.status(202).json({ deleted: true, modelName });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return res.status(404).json({ error: "Model not found" });
+    }
+    res.status(400).json({ error: error.message || "Delete failed" });
+  }
+});
+
 app.get("/ui/models", (_, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="en">
@@ -589,6 +667,7 @@ app.get("/ui/models", (_, res) => {
         <input id="file" type="file" accept=".glb,.gltf,.usdz,.usdc,.obj,.fbx" />
         <button id="uploadBtn">Upload Model</button>
       </div>
+      <input id="replaceFileInput" type="file" accept=".glb,.gltf,.usdz,.usdc,.obj,.fbx" style="display:none;" />
       <div id="status" class="status"></div>
     </section>
 
@@ -665,6 +744,18 @@ app.get("/ui/models", (_, res) => {
     </section>
 
     <section class="card">
+      <h2>Model Capability Inspector</h2>
+      <p class="muted">Check whether a model is ready for walk/gesture/skill control.</p>
+      <div class="row">
+        <label class="column">Model
+          <select id="inspectModelSelect"></select>
+        </label>
+        <button id="inspectModelBtn" class="ghost">Inspect Model</button>
+      </div>
+      <pre id="inspectOutput">Select a model and click "Inspect Model".</pre>
+    </section>
+
+    <section class="card">
       <h2>Existing Models</h2>
       <p id="modelsDir" class="muted"></p>
       <table class="table" id="table">
@@ -684,6 +775,7 @@ app.get("/ui/models", (_, res) => {
   </main>
   <script>
     const fileInput = document.getElementById("file");
+    const replaceFileInput = document.getElementById("replaceFileInput");
     const uploadBtn = document.getElementById("uploadBtn");
     const statusEl = document.getElementById("status");
     const modelsDirEl = document.getElementById("modelsDir");
@@ -704,9 +796,13 @@ app.get("/ui/models", (_, res) => {
     const saveSceneBtn = document.getElementById("saveSceneBtn");
     const sceneSummary = document.getElementById("sceneSummary");
     const mcpContextEl = document.getElementById("mcpContext");
+    const inspectModelSelect = document.getElementById("inspectModelSelect");
+    const inspectModelBtn = document.getElementById("inspectModelBtn");
+    const inspectOutput = document.getElementById("inspectOutput");
 
     let modelsCache = [];
     let sceneCache = { activeModel: "", activeCharacterId: "" };
+    let pendingReplaceModelName = "";
 
     const formatBytes = (n) => {
       if (n < 1024) return n + " B";
@@ -729,6 +825,7 @@ app.get("/ui/models", (_, res) => {
       const modelOptions = modelsCache.map((model) => '<option value="' + model.name + '">' + model.name + '</option>').join("");
       charModelSelect.innerHTML = modelOptions || '<option value="">No models</option>';
       activeModelSelect.innerHTML = '<option value="">(none)</option>' + modelOptions;
+      inspectModelSelect.innerHTML = modelOptions || '<option value="">No models</option>';
 
       if (sceneCache.activeModel && getModel(sceneCache.activeModel)) {
         activeModelSelect.value = sceneCache.activeModel;
@@ -737,6 +834,9 @@ app.get("/ui/models", (_, res) => {
       }
       if (charModelSelect.value === "" && modelsCache[0]) {
         charModelSelect.value = modelsCache[0].name;
+      }
+      if (inspectModelSelect.value === "" && modelsCache[0]) {
+        inspectModelSelect.value = modelsCache[0].name;
       }
     };
 
@@ -790,6 +890,9 @@ app.get("/ui/models", (_, res) => {
             previewBtn +
             ' <button class="ghost" data-focus-model="' + model.name + '">Edit Characters</button>' +
             ' <button class="ghost" data-active-model="' + model.name + '">Set Active</button>' +
+            ' <button class="ghost" data-replace-model="' + model.name + '">Replace</button>' +
+            ' <button class="ghost" data-delete-model="' + model.name + '">Delete</button>' +
+            ' <button class="ghost" data-inspect-model="' + model.name + '">Inspect</button>' +
             '<div class="muted">' + model.projectPath + "</div>" +
           "</td>",
         ].join("");
@@ -846,7 +949,43 @@ app.get("/ui/models", (_, res) => {
         renderActiveCharacterOptions();
         setStatus("Selected active model: " + modelName);
       }
+      const inspectBtn = event.target.closest("button[data-inspect-model]");
+      if (inspectBtn) {
+        const modelName = inspectBtn.getAttribute("data-inspect-model");
+        inspectModelSelect.value = modelName;
+        inspectSelectedModel();
+      }
+      const replaceBtn = event.target.closest("button[data-replace-model]");
+      if (replaceBtn) {
+        pendingReplaceModelName = replaceBtn.getAttribute("data-replace-model");
+        replaceFileInput.value = "";
+        replaceFileInput.click();
+      }
+      const deleteBtn = event.target.closest("button[data-delete-model]");
+      if (deleteBtn) {
+        const modelName = deleteBtn.getAttribute("data-delete-model");
+        deleteModel(modelName);
+      }
     });
+
+    const inspectSelectedModel = async () => {
+      const modelName = inspectModelSelect.value;
+      if (!modelName) {
+        inspectOutput.textContent = "No model selected.";
+        return;
+      }
+      if (typeof window.inspectModelCapabilities !== "function") {
+        inspectOutput.textContent = "Inspector engine not ready. Refresh page and try again.";
+        return;
+      }
+      inspectOutput.textContent = "Inspecting " + modelName + "...";
+      try {
+        const report = await window.inspectModelCapabilities(modelName);
+        inspectOutput.textContent = JSON.stringify(report, null, 2);
+      } catch (error) {
+        inspectOutput.textContent = "Inspection failed: " + (error?.message || "unknown error");
+      }
+    };
 
     characterList.addEventListener("click", async (event) => {
       const btn = event.target.closest("button[data-delete-character]");
@@ -901,6 +1040,54 @@ app.get("/ui/models", (_, res) => {
         uploadBtn.disabled = false;
       }
     });
+
+    replaceFileInput.addEventListener("change", async () => {
+      const modelName = pendingReplaceModelName;
+      const file = replaceFileInput.files?.[0];
+      pendingReplaceModelName = "";
+      if (!modelName || !file) {
+        return;
+      }
+      setStatus("Replacing " + modelName + " ...");
+      try {
+        const response = await fetch("/api/models/" + encodeURIComponent(modelName) + "/replace", {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "x-filename": file.name,
+          },
+          body: file,
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus(payload.error || "Replace failed.", true);
+          return;
+        }
+        setStatus("Replaced model: " + payload.replaced.name);
+        await loadModels();
+      } catch (error) {
+        setStatus("Replace failed: " + (error?.message || "unknown error"), true);
+      }
+    });
+
+    const deleteModel = async (modelName) => {
+      if (!modelName) return;
+      const ok = window.confirm("Delete model '" + modelName + "'? This also removes its characters and clears active scene if selected.");
+      if (!ok) return;
+      setStatus("Deleting " + modelName + " ...");
+      try {
+        const response = await fetch("/api/models/" + encodeURIComponent(modelName), { method: "DELETE" });
+        const payload = await response.json();
+        if (!response.ok) {
+          setStatus(payload.error || "Delete failed.", true);
+          return;
+        }
+        setStatus("Deleted model: " + modelName);
+        await loadModels();
+      } catch (error) {
+        setStatus("Delete failed: " + (error?.message || "unknown error"), true);
+      }
+    };
 
     saveCharacterBtn.addEventListener("click", async () => {
       const modelName = charModelSelect.value;
@@ -971,7 +1158,119 @@ app.get("/ui/models", (_, res) => {
       renderActiveCharacterOptions();
     });
 
+    inspectModelBtn.addEventListener("click", inspectSelectedModel);
+
     loadModels().catch((error) => setStatus("Failed to load models: " + error.message, true));
+  </script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.166.1/build/three.module.js"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/loaders/GLTFLoader.js";
+
+    const loader = new GLTFLoader();
+
+    const hasHumanoidBones = (bones) => {
+      const names = bones.map((name) => name.toLowerCase());
+      const needs = ["hip", "spine", "head"];
+      const hasCore = needs.every((needle) => names.some((name) => name.includes(needle)));
+      const hasArm = names.some((name) => name.includes("arm")) || names.some((name) => name.includes("shoulder"));
+      const hasLeg = names.some((name) => name.includes("leg")) || names.some((name) => name.includes("thigh"));
+      return hasCore && hasArm && hasLeg;
+    };
+
+    const classifyAnimations = (clips) => {
+      const names = clips.map((clip) => clip.name || "");
+      const lower = names.map((name) => name.toLowerCase());
+      return {
+        names,
+        hasIdle: lower.some((name) => name.includes("idle")),
+        hasWalk: lower.some((name) => name.includes("walk") || name.includes("run")),
+        hasGesture: lower.some((name) => name.includes("wave") || name.includes("gesture") || name.includes("emote")),
+        hasAttack: lower.some((name) => name.includes("attack") || name.includes("shoot") || name.includes("cast")),
+      };
+    };
+
+    window.inspectModelCapabilities = async (modelName) => {
+      if (!modelName || (!modelName.toLowerCase().endsWith(".glb") && !modelName.toLowerCase().endsWith(".gltf"))) {
+        return {
+          model: modelName,
+          inspectable: false,
+          reason: "Inspector currently supports .glb/.gltf models.",
+          readyForAiControl: false,
+        };
+      }
+
+      const url = "/assets/models/" + encodeURIComponent(modelName);
+      const gltf = await new Promise((resolve, reject) => {
+        loader.load(url, resolve, undefined, reject);
+      });
+      const scene = gltf.scene;
+
+      let meshCount = 0;
+      let skinnedMeshCount = 0;
+      const bones = new Set();
+      scene.traverse((node) => {
+        if (node.isMesh) {
+          meshCount += 1;
+        }
+        if (node.isSkinnedMesh) {
+          skinnedMeshCount += 1;
+        }
+        if (node.isBone) {
+          bones.add(node.name || "unnamed-bone");
+        }
+      });
+
+      const boneList = Array.from(bones);
+      const animSummary = classifyAnimations(gltf.animations || []);
+      const humanoid = hasHumanoidBones(boneList);
+      const readyWalk = skinnedMeshCount > 0 && animSummary.hasWalk;
+      const readyGesture = skinnedMeshCount > 0 && (animSummary.hasGesture || animSummary.hasAttack);
+      const readyFire = skinnedMeshCount > 0 && animSummary.hasAttack;
+
+      const checks = {
+        hasMeshes: meshCount > 0,
+        hasRig: skinnedMeshCount > 0,
+        humanoidBonePattern: humanoid,
+        hasIdleClip: animSummary.hasIdle,
+        hasWalkClip: animSummary.hasWalk,
+        hasGestureClip: animSummary.hasGesture,
+        hasAttackClip: animSummary.hasAttack,
+      };
+
+      const recommendations = [];
+      if (!checks.hasRig) recommendations.push("Add armature/skin for character-like control.");
+      if (!checks.hasWalkClip) recommendations.push("Add animation clip named Walk or Run.");
+      if (!checks.hasIdleClip) recommendations.push("Add animation clip named Idle.");
+      if (!checks.hasGestureClip) recommendations.push("Add gesture clip (Wave/Gesture/Emote).");
+      if (!checks.hasAttackClip) recommendations.push("Add attack/cast/shoot clip for fire or skills.");
+
+      return {
+        model: modelName,
+        inspectable: true,
+        stats: {
+          meshCount,
+          skinnedMeshCount,
+          boneCount: boneList.length,
+          animationClipCount: animSummary.names.length,
+          animationNames: animSummary.names,
+        },
+        checks,
+        capabilityScore: {
+          moveHumanLike: readyWalk,
+          liftHandsOrGesture: readyGesture,
+          shootFireOrCast: readyFire,
+        },
+        readyForAiControl: readyWalk,
+        recommendations,
+      };
+    };
   </script>
 </body>
 </html>`);
