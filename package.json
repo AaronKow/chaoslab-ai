@@ -1,0 +1,13 @@
+{
+  "name": "chaoslab-ai",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "services/*"
+  ],
+  "scripts": {
+    "dev:server": "npm --workspace services/orchestrator run dev",
+    "dev:mobile": "npm --workspace apps/mobile-expo run start"
+  }
+}

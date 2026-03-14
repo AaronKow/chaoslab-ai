@@ -1,0 +1,15 @@
+{
+  "expo": {
+    "name": "ChaosLab AR Pilot",
+    "slug": "chaoslab-ar-pilot",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "ai.chaoslab.arpilot",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Camera is used for AR character placement."
+      }
+    }
+  }
+}
