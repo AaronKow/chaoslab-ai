@@ -119,6 +119,53 @@ Content-Type: application/json
 
 For full request/response details, see [`docs/http-api.md`](docs/http-api.md).
 
+## 4) Autonomous MCP Agent (Copilot bridge scaffold)
+
+This repo now includes a minimal autonomous worker:
+
+- `services/mcp-agent`
+
+What it does:
+1. starts (or reuses) a session
+2. reads role context from `GET /api/mcp/context`
+3. auto-spawns the active character (if needed)
+4. continuously sends `move_to` + periodic `say` commands to `/control/:sessionId`
+
+### Setup order
+
+1. Start orchestrator:
+
+```bash
+pnpm run dev:server
+```
+
+2. Open model manager and set active character:
+
+```text
+http://localhost:8787/ui/models
+```
+
+3. (Optional) Open runtime preview:
+
+```text
+http://localhost:8787/ui/runtime
+```
+
+4. Start autonomous agent:
+
+```bash
+pnpm run dev:agent
+```
+
+### Useful env vars
+
+- `ORCHESTRATOR_URL` (default: `http://localhost:8787`)
+- `SESSION_ID` (reuse an existing session)
+- `TICK_MS` (default: `3000`)
+- `CHAT_EVERY_N_TICKS` (default: `3`)
+- `AUTO_SPAWN` (`false` disables spawn helper)
+- `MOVE_RADIUS` (default: `4`)
+
 ## Troubleshooting
 
 - `npm install` fails:
