@@ -16,25 +16,27 @@ const toolSchemas = [
     },
   },
   {
-    name: "start_session",
-    description: "Create a new orchestrator session for runtime/mobile clients.",
+    name: "get_shared_session",
+    description: "Get the shared session id used by default by all tools when sessionId is omitted.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
-      properties: {
-        deviceId: { type: "string", description: "Optional logical device id." },
-      },
+      properties: {},
     },
   },
   {
-    name: "spawn_active",
-    description: "Spawn active model+character for a given session.",
+    name: "spawn_avatar",
+    description: "Spawn a specific avatar (character id or name). Recommended tool for AI control.",
     inputSchema: {
       type: "object",
-      required: ["sessionId"],
+      required: ["character"],
       additionalProperties: false,
       properties: {
-        sessionId: { type: "string" },
+        sessionId: { type: "string", description: "Optional. Defaults to shared session." },
+        character: {
+          type: "string",
+          description: "Character id or character name, e.g. dora-rock",
+        },
         position: {
           type: "array",
           minItems: 3,
@@ -46,13 +48,13 @@ const toolSchemas = [
   },
   {
     name: "send_command",
-    description: "Send a control command to orchestrator for a session.",
+    description: "Send a control command. If sessionId is omitted, uses shared session.",
     inputSchema: {
       type: "object",
-      required: ["sessionId", "type", "payload"],
+      required: ["type", "payload"],
       additionalProperties: false,
       properties: {
-        sessionId: { type: "string" },
+        sessionId: { type: "string", description: "Optional. Defaults to shared session." },
         type: { type: "string", description: "spawn | move_to | say | other custom command type" },
         payload: { type: "object" },
       },
@@ -60,13 +62,12 @@ const toolSchemas = [
   },
   {
     name: "get_world",
-    description: "Read current actor/chats world state for a session.",
+    description: "Read current actor/chats world state. If sessionId is omitted, uses shared session.",
     inputSchema: {
       type: "object",
-      required: ["sessionId"],
       additionalProperties: false,
       properties: {
-        sessionId: { type: "string" },
+        sessionId: { type: "string", description: "Optional. Defaults to shared session." },
       },
     },
   },
@@ -132,6 +133,65 @@ function requireString(name, value) {
   return value.trim();
 }
 
+function optionalString(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return value.trim();
+}
+
+function normalizeText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function pickCharacterFromModels(modelsPayload, query) {
+  const models = Array.isArray(modelsPayload?.models) ? modelsPayload.models : [];
+  const wanted = normalizeText(query);
+  if (!wanted) {
+    return null;
+  }
+
+  // First pass: exact match on id, actorId, or name.
+  for (const model of models) {
+    const chars = Array.isArray(model?.characters) ? model.characters : [];
+    for (const character of chars) {
+      const id = normalizeText(character?.id);
+      const actorId = normalizeText(character?.actorId);
+      const name = normalizeText(character?.name);
+      if (wanted === id || wanted === actorId || wanted === name) {
+        return { model, character };
+      }
+    }
+  }
+
+  // Second pass: contains.
+  for (const model of models) {
+    const chars = Array.isArray(model?.characters) ? model.characters : [];
+    for (const character of chars) {
+      const id = normalizeText(character?.id);
+      const actorId = normalizeText(character?.actorId);
+      const name = normalizeText(character?.name);
+      if (id.includes(wanted) || actorId.includes(wanted) || name.includes(wanted)) {
+        return { model, character };
+      }
+    }
+  }
+
+  return null;
+}
+
+async function resolveSessionId(optionalSessionId) {
+  const explicit = optionalString(optionalSessionId);
+  if (explicit) {
+    return { sessionId: explicit, shared: false };
+  }
+  const response = await orchestratorRequest("/api/session/shared");
+  if (!response.ok || typeof response.body?.sessionId !== "string") {
+    throw new Error(`Failed to get shared session: ${response.status}`);
+  }
+  return { sessionId: response.body.sessionId, shared: true };
+}
+
 async function handleToolCall(name, args) {
   if (!isObject(args)) {
     throw new Error("Tool arguments must be an object");
@@ -141,15 +201,19 @@ async function handleToolCall(name, args) {
     return asTextResult(response.body);
   }
   if (name === "start_session") {
-    const response = await orchestratorRequest("/session/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceId: typeof args.deviceId === "string" ? args.deviceId : "copilot-mcp" }),
+    const response = await orchestratorRequest("/api/session/shared");
+    return asTextResult({
+      ...response.body,
+      note: "start_session is mapped to shared session to prevent runtime mismatch.",
     });
+  }
+  if (name === "get_shared_session") {
+    const response = await orchestratorRequest("/api/session/shared");
     return asTextResult(response.body);
   }
   if (name === "spawn_active") {
-    const sessionId = requireString("sessionId", args.sessionId);
+    const resolved = await resolveSessionId(args.sessionId);
+    const sessionId = resolved.sessionId;
     const response = await orchestratorRequest(`/api/scene/spawn/${encodeURIComponent(sessionId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -157,10 +221,51 @@ async function handleToolCall(name, args) {
         position: Array.isArray(args.position) ? args.position : [0, 0, 0],
       }),
     });
-    return asTextResult(response.body);
+    return asTextResult({ ...response.body, sessionId, sharedSessionFallback: resolved.shared });
+  }
+  if (name === "spawn_avatar") {
+    const resolved = await resolveSessionId(args.sessionId);
+    const sessionId = resolved.sessionId;
+    const characterQuery = requireString("character", args.character);
+
+    const modelsResponse = await orchestratorRequest("/api/models");
+    if (!modelsResponse.ok) {
+      throw new Error(`Failed to list models/characters: ${modelsResponse.status}`);
+    }
+    const picked = pickCharacterFromModels(modelsResponse.body, characterQuery);
+    if (!picked) {
+      throw new Error(`Character not found: ${characterQuery}`);
+    }
+
+    const response = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "spawn",
+        payload: {
+          actorId: picked.character.actorId || picked.character.id,
+          modelName: picked.model.name,
+          characterId: picked.character.id || "",
+          name: picked.character.name || picked.character.id || "Character",
+          role: picked.character.role || "",
+          position: Array.isArray(args.position) ? args.position : [0, 0, 0],
+        },
+      }),
+    });
+    return asTextResult({
+      ...response.body,
+      sessionId,
+      sharedSessionFallback: resolved.shared,
+      selectedCharacter: {
+        query: characterQuery,
+        matchedModel: picked.model.name,
+        matchedCharacter: picked.character,
+      },
+    });
   }
   if (name === "send_command") {
-    const sessionId = requireString("sessionId", args.sessionId);
+    const resolved = await resolveSessionId(args.sessionId);
+    const sessionId = resolved.sessionId;
     const type = requireString("type", args.type);
     const payload = isObject(args.payload) ? args.payload : {};
     const response = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
@@ -168,12 +273,13 @@ async function handleToolCall(name, args) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ type, payload }),
     });
-    return asTextResult(response.body);
+    return asTextResult({ ...response.body, sessionId, sharedSessionFallback: resolved.shared });
   }
   if (name === "get_world") {
-    const sessionId = requireString("sessionId", args.sessionId);
+    const resolved = await resolveSessionId(args.sessionId);
+    const sessionId = resolved.sessionId;
     const response = await orchestratorRequest(`/api/world?sessionId=${encodeURIComponent(sessionId)}`);
-    return asTextResult(response.body);
+    return asTextResult({ ...response.body, sessionId, sharedSessionFallback: resolved.shared });
   }
   if (name === "list_models") {
     const response = await orchestratorRequest("/api/models");

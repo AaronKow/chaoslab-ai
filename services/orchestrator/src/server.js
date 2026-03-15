@@ -10,6 +10,9 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 8787;
 const SESSION_TTL_MS = 1000 * 60 * 30;
+const SHARED_SESSION_ID = "shared-main";
+const SHARED_DEVICE_ID = "shared-runtime";
+const SHARED_SESSION_ALIASES = new Set(["shared-main", "shared-session", "shared"]);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -181,8 +184,9 @@ function createSceneSnapshot(models, registry, sceneState) {
 }
 
 function requireSession(req, res, next) {
-  const sessionId = req.header("x-session-id") || req.body?.sessionId || req.query?.sessionId;
-  if (!sessionId || !sessions.has(sessionId)) {
+  const requestedSessionId = req.header("x-session-id") || req.body?.sessionId || req.query?.sessionId;
+  const sessionId = resolveSessionIdInput(requestedSessionId);
+  if (!sessions.has(sessionId)) {
     return res.status(401).json({ error: "Missing or invalid session" });
   }
   const session = sessions.get(sessionId);
@@ -196,6 +200,54 @@ function requireSession(req, res, next) {
   session.lastSeenAt = now();
   req.sessionId = sessionId;
   next();
+}
+
+function resolveSessionIdInput(inputSessionId) {
+  const requested = toSafeText(inputSessionId);
+  if (!requested) {
+    return ensureSharedSession();
+  }
+  if (SHARED_SESSION_ALIASES.has(requested)) {
+    return ensureSharedSession();
+  }
+  return requested;
+}
+
+function createSessionRecord(sessionId, deviceId) {
+  const initialTimestamp = now();
+  sessions.set(sessionId, {
+    deviceId,
+    createdAt: initialTimestamp,
+    lastSeenAt: initialTimestamp,
+    cursor: 0,
+  });
+  commandQueues.set(sessionId, []);
+  acknowledgements.set(sessionId, []);
+  worldStates.set(sessionId, { actors: new Map(), chats: [] });
+  return {
+    sessionId,
+    polling: {
+      minMs: 300,
+      maxMs: 2000,
+      suggestedMs: 500,
+    },
+  };
+}
+
+function ensureSharedSession() {
+  const shared = sessions.get(SHARED_SESSION_ID);
+  if (!shared) {
+    createSessionRecord(SHARED_SESSION_ID, SHARED_DEVICE_ID);
+    return SHARED_SESSION_ID;
+  }
+  if (now() - shared.lastSeenAt > SESSION_TTL_MS) {
+    sessions.delete(SHARED_SESSION_ID);
+    commandQueues.delete(SHARED_SESSION_ID);
+    acknowledgements.delete(SHARED_SESSION_ID);
+    worldStates.delete(SHARED_SESSION_ID);
+    createSessionRecord(SHARED_SESSION_ID, SHARED_DEVICE_ID);
+  }
+  return SHARED_SESSION_ID;
 }
 
 function enqueueCommand(sessionId, type, payload) {
@@ -285,8 +337,66 @@ function applyCommandToWorld(sessionId, type, payload) {
   }
 }
 
+async function resolveActorIdFromPayload(sessionId, payload) {
+  const world = ensureWorldState(sessionId);
+  const directActorId = toSafeText(payload?.actorId);
+  if (directActorId && world.actors.has(directActorId)) {
+    return directActorId;
+  }
+
+  const characterId = toSafeText(payload?.characterId);
+  if (characterId) {
+    for (const actor of world.actors.values()) {
+      if (toSafeText(actor.characterId) === characterId) {
+        return actor.actorId;
+      }
+    }
+  }
+
+  const byName = toSafeText(payload?.name);
+  if (byName) {
+    for (const actor of world.actors.values()) {
+      if (toSafeText(actor.name).toLowerCase() === byName.toLowerCase()) {
+        return actor.actorId;
+      }
+    }
+  }
+
+  if (world.actors.size === 1) {
+    return Array.from(world.actors.keys())[0];
+  }
+
+  const sceneState = await readSceneState();
+  if (sceneState.activeCharacterId) {
+    const registry = await readCharacterRegistry();
+    const characters = Array.isArray(registry[sceneState.activeModel]) ? registry[sceneState.activeModel] : [];
+    const activeCharacter = characters.find((character) => character.id === sceneState.activeCharacterId);
+    if (activeCharacter?.actorId && world.actors.has(activeCharacter.actorId)) {
+      return activeCharacter.actorId;
+    }
+  }
+
+  return directActorId || "";
+}
+
 app.get("/health", (_, res) => {
-  res.json({ ok: true, sessions: sessions.size });
+  const sharedSessionId = ensureSharedSession();
+  res.json({ ok: true, sessions: sessions.size, sharedSessionId });
+});
+
+app.get("/api/session/shared", (_, res) => {
+  const sessionId = ensureSharedSession();
+  const session = sessions.get(sessionId);
+  session.lastSeenAt = now();
+  res.json({
+    sessionId,
+    shared: true,
+    polling: {
+      minMs: 300,
+      maxMs: 2000,
+      suggestedMs: 500,
+    },
+  });
 });
 
 app.get("/", (_, res) => {
@@ -455,11 +565,11 @@ app.get("/api/mcp/context", async (_, res) => {
         { type: "say", payload: { actorId: "string", text: "string", bubbleTtlMs: "number(optional)" } },
         { type: "move_to", payload: { actorId: "string", position: "[x,y,z]", speed: "number(optional)" } },
       ],
-      targetEndpoint: "POST /control/:sessionId",
+      targetEndpoint: "POST /control (shared session default) or POST /control/:sessionId",
       autonomyLoop: [
         "Read /api/mcp/context.",
-        "Ensure active character is spawned once with type=spawn.",
-        "Then continuously send move_to/say to /control/:sessionId for the same actorId.",
+        "Ensure active character is spawned once with POST /api/scene/spawn (shared).",
+        "Then continuously send move_to/say to POST /control for the same actorId.",
       ],
     });
   } catch (error) {
@@ -477,30 +587,64 @@ app.get("/api/world", requireSession, (req, res) => {
   });
 });
 
+app.post("/api/world/reset", (req, res) => {
+  const sessionId = ensureSharedSession();
+  worldStates.set(sessionId, { actors: new Map(), chats: [] });
+  commandQueues.set(sessionId, []);
+  acknowledgements.set(sessionId, []);
+  const session = sessions.get(sessionId);
+  if (session) {
+    session.cursor = 0;
+    session.lastSeenAt = now();
+  }
+  res.status(202).json({ reset: true, sessionId, shared: true });
+});
+
+async function spawnSceneIntoSession(sessionId, spawnPosition) {
+  const [models, registry, sceneState] = await Promise.all([
+    listModels(),
+    readCharacterRegistry(),
+    readSceneState(),
+  ]);
+  const scene = createSceneSnapshot(models, registry, sceneState);
+  if (!scene.activeModel || !scene.activeCharacter) {
+    return { error: "No active model/character selected. Configure in /ui/models first." };
+  }
+  const command = enqueueCommand(sessionId, "spawn", {
+    actorId: scene.activeCharacter.actorId,
+    modelName: scene.activeModel,
+    characterId: scene.activeCharacter.id,
+    name: scene.activeCharacter.name,
+    role: scene.activeCharacter.role,
+    position: Array.isArray(spawnPosition) ? spawnPosition : [0, 0, 0],
+  });
+  return { command, scene };
+}
+
 app.post("/api/scene/spawn/:sessionId", async (req, res) => {
   try {
-    const sessionId = req.params.sessionId;
+    const sessionId = resolveSessionIdInput(req.params.sessionId);
     if (!sessions.has(sessionId)) {
       return res.status(404).json({ error: "session not found" });
     }
-    const [models, registry, sceneState] = await Promise.all([
-      listModels(),
-      readCharacterRegistry(),
-      readSceneState(),
-    ]);
-    const scene = createSceneSnapshot(models, registry, sceneState);
-    if (!scene.activeModel || !scene.activeCharacter) {
-      return res.status(400).json({ error: "No active model/character selected. Configure in /ui/models first." });
+    const spawned = await spawnSceneIntoSession(sessionId, req.body?.position);
+    if (spawned.error) {
+      return res.status(400).json({ error: spawned.error });
     }
-    const command = enqueueCommand(sessionId, "spawn", {
-      actorId: scene.activeCharacter.actorId,
-      modelName: scene.activeModel,
-      characterId: scene.activeCharacter.id,
-      name: scene.activeCharacter.name,
-      role: scene.activeCharacter.role,
-      position: Array.isArray(req.body?.position) ? req.body.position : [0, 0, 0],
-    });
-    res.status(201).json({ command, scene });
+    res.status(201).json(spawned);
+  } catch (error) {
+    res.status(400).json({ error: error.message || "Failed to spawn active character" });
+  }
+});
+
+app.post("/api/scene/spawn", async (req, res) => {
+  try {
+    const sessionId = ensureSharedSession();
+    const spawned = await spawnSceneIntoSession(sessionId, req.body?.position);
+    if (spawned.error) {
+      return res.status(400).json({ error: spawned.error });
+    }
+    res.status(201).json({ ...spawned, sessionId, shared: true });
   } catch (error) {
     res.status(400).json({ error: error.message || "Failed to spawn active character" });
   }
@@ -672,22 +816,6 @@ app.get("/ui/models", (_, res) => {
     </section>
 
     <section class="card">
-      <h2>Active Scene Context</h2>
-      <div class="row">
-        <label class="column">Active Model
-          <select id="activeModelSelect"></select>
-        </label>
-        <label class="column">Active Character
-          <select id="activeCharacterSelect"></select>
-        </label>
-      </div>
-      <div class="row">
-        <button id="saveSceneBtn">Save Active Scene</button>
-      </div>
-      <p id="sceneSummary" class="muted"></p>
-    </section>
-
-    <section class="card">
       <h2>Preview</h2>
       <model-viewer id="viewer" camera-controls auto-rotate interaction-prompt="none"></model-viewer>
       <p id="viewerHint" class="muted">Select a GLB/GLTF model below to preview it here.</p>
@@ -791,10 +919,6 @@ app.get("/ui/models", (_, res) => {
     const charBioInput = document.getElementById("charBio");
     const saveCharacterBtn = document.getElementById("saveCharacterBtn");
     const characterList = document.getElementById("characterList");
-    const activeModelSelect = document.getElementById("activeModelSelect");
-    const activeCharacterSelect = document.getElementById("activeCharacterSelect");
-    const saveSceneBtn = document.getElementById("saveSceneBtn");
-    const sceneSummary = document.getElementById("sceneSummary");
     const mcpContextEl = document.getElementById("mcpContext");
     const inspectModelSelect = document.getElementById("inspectModelSelect");
     const inspectModelBtn = document.getElementById("inspectModelBtn");
@@ -824,34 +948,14 @@ app.get("/ui/models", (_, res) => {
     const renderModelOptions = () => {
       const modelOptions = modelsCache.map((model) => '<option value="' + model.name + '">' + model.name + '</option>').join("");
       charModelSelect.innerHTML = modelOptions || '<option value="">No models</option>';
-      activeModelSelect.innerHTML = '<option value="">(none)</option>' + modelOptions;
       inspectModelSelect.innerHTML = modelOptions || '<option value="">No models</option>';
 
-      if (sceneCache.activeModel && getModel(sceneCache.activeModel)) {
-        activeModelSelect.value = sceneCache.activeModel;
-      } else if (modelsCache[0]) {
-        activeModelSelect.value = modelsCache[0].name;
-      }
       if (charModelSelect.value === "" && modelsCache[0]) {
         charModelSelect.value = modelsCache[0].name;
       }
       if (inspectModelSelect.value === "" && modelsCache[0]) {
         inspectModelSelect.value = modelsCache[0].name;
       }
-    };
-
-    const renderActiveCharacterOptions = () => {
-      const modelName = activeModelSelect.value;
-      const chars = getCharactersForModel(modelName);
-      activeCharacterSelect.innerHTML = '<option value="">(none)</option>' + chars
-        .map((character) => '<option value="' + character.id + '">' + character.name + " (" + character.id + ")</option>")
-        .join("");
-      if (sceneCache.activeCharacterId) {
-        activeCharacterSelect.value = sceneCache.activeCharacterId;
-      }
-      const selectedChar = chars.find((character) => character.id === activeCharacterSelect.value);
-      sceneSummary.textContent = "Active model: " + (modelName || "(none)") +
-        " | Active character: " + (selectedChar ? selectedChar.name + " (" + selectedChar.id + ")" : "(none)");
     };
 
     const renderCharacterList = () => {
@@ -889,7 +993,6 @@ app.get("/ui/models", (_, res) => {
           '<td>' +
             previewBtn +
             ' <button class="ghost" data-focus-model="' + model.name + '">Edit Characters</button>' +
-            ' <button class="ghost" data-active-model="' + model.name + '">Set Active</button>' +
             ' <button class="ghost" data-replace-model="' + model.name + '">Replace</button>' +
             ' <button class="ghost" data-delete-model="' + model.name + '">Delete</button>' +
             ' <button class="ghost" data-inspect-model="' + model.name + '">Inspect</button>' +
@@ -922,7 +1025,6 @@ app.get("/ui/models", (_, res) => {
       modelsCache = Array.isArray(data.models) ? data.models : [];
       sceneCache = data.scene || { activeModel: "", activeCharacterId: "" };
       renderModelOptions();
-      renderActiveCharacterOptions();
       renderCharacterList();
       renderModelTable();
       loadMcpContext();
@@ -941,13 +1043,6 @@ app.get("/ui/models", (_, res) => {
         charModelSelect.value = modelName;
         renderCharacterList();
         setStatus("Editing characters for " + modelName);
-      }
-      const activeBtn = event.target.closest("button[data-active-model]");
-      if (activeBtn) {
-        const modelName = activeBtn.getAttribute("data-active-model");
-        activeModelSelect.value = modelName;
-        renderActiveCharacterOptions();
-        setStatus("Selected active model: " + modelName);
       }
       const inspectBtn = event.target.closest("button[data-inspect-model]");
       if (inspectBtn) {
@@ -1121,42 +1216,7 @@ app.get("/ui/models", (_, res) => {
       }
     });
 
-    activeModelSelect.addEventListener("change", () => {
-      sceneCache.activeModel = activeModelSelect.value;
-      sceneCache.activeCharacterId = "";
-      renderActiveCharacterOptions();
-    });
-
     charModelSelect.addEventListener("change", renderCharacterList);
-
-    saveSceneBtn.addEventListener("click", async () => {
-      const payload = {
-        activeModel: activeModelSelect.value,
-        activeCharacterId: activeCharacterSelect.value,
-      };
-      try {
-        const response = await fetch("/api/scene", {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          setStatus(data.error || "Failed to save active scene.", true);
-          return;
-        }
-        sceneCache = data.scene || sceneCache;
-        setStatus("Active scene saved.");
-        await loadModels();
-      } catch (error) {
-        setStatus("Failed to save scene: " + (error?.message || "unknown error"), true);
-      }
-    });
-
-    activeCharacterSelect.addEventListener("change", () => {
-      sceneCache.activeCharacterId = activeCharacterSelect.value;
-      renderActiveCharacterOptions();
-    });
 
     inspectModelBtn.addEventListener("click", inspectSelectedModel);
 
@@ -1184,15 +1244,59 @@ app.get("/ui/models", (_, res) => {
       return hasCore && hasArm && hasLeg;
     };
 
+    const ACTION_SPEC = {
+      normal_actions: {
+        "idle loop": ["idle"],
+        "sprint loop": ["sprint"],
+        "walk loop": ["walk"],
+      },
+      take_damages: {
+        "hit chest": ["hit chest", "hit_chest", "chest hit"],
+        "hit knockback rm": ["hit knockback rm", "knockback rm", "hit knockback", "knockback"],
+      },
+      attacks: {
+        "fighting right jab": ["fighting right jab", "right jab", "jab right"],
+        "fighting left jab": ["fighting left jab", "left jab", "jab left"],
+        defend: ["defend", "block", "guard"],
+      },
+      reactions: {
+        dizzy: ["dizzy", "stun", "stunned"],
+      },
+      jumping: {
+        "jump start": ["jump start", "jump_start", "jumpstart"],
+        "jump land": ["jump land", "jump_land", "jumpland", "land"],
+      },
+      dancing: {
+        "jumping jacks": ["jumping jacks", "jumping_jacks", "jumpingjacks"],
+        "dance loop": ["dance loop", "dance_loop", "dance"],
+        backflip: ["backflip", "back flip"],
+      },
+      additionals: {
+        meditate: ["meditate", "meditation"],
+      },
+    };
+
     const classifyAnimations = (clips) => {
       const names = clips.map((clip) => clip.name || "");
-      const lower = names.map((name) => name.toLowerCase());
+      const lowerNames = names.map((name) => name.toLowerCase());
+      const coverage = {};
+      const matchedByAction = {};
+
+      for (const [groupName, group] of Object.entries(ACTION_SPEC)) {
+        coverage[groupName] = {};
+        for (const [actionName, keywords] of Object.entries(group)) {
+          const matches = names.filter((_, i) =>
+            keywords.some((keyword) => lowerNames[i].includes(keyword.toLowerCase())),
+          );
+          coverage[groupName][actionName] = matches.length > 0;
+          matchedByAction[actionName] = matches;
+        }
+      }
+
       return {
         names,
-        hasIdle: lower.some((name) => name.includes("idle")),
-        hasWalk: lower.some((name) => name.includes("walk") || name.includes("run")),
-        hasGesture: lower.some((name) => name.includes("wave") || name.includes("gesture") || name.includes("emote")),
-        hasAttack: lower.some((name) => name.includes("attack") || name.includes("shoot") || name.includes("cast")),
+        coverage,
+        matchedByAction,
       };
     };
 
@@ -1230,26 +1334,33 @@ app.get("/ui/models", (_, res) => {
       const boneList = Array.from(bones);
       const animSummary = classifyAnimations(gltf.animations || []);
       const humanoid = hasHumanoidBones(boneList);
-      const readyWalk = skinnedMeshCount > 0 && animSummary.hasWalk;
-      const readyGesture = skinnedMeshCount > 0 && (animSummary.hasGesture || animSummary.hasAttack);
-      const readyFire = skinnedMeshCount > 0 && animSummary.hasAttack;
+      const readyWalk = skinnedMeshCount > 0
+        && animSummary.coverage.normal_actions["idle loop"]
+        && animSummary.coverage.normal_actions["walk loop"]
+        && animSummary.coverage.normal_actions["sprint loop"];
+      const readyGesture = skinnedMeshCount > 0
+        && animSummary.coverage.attacks.defend
+        && animSummary.coverage.reactions.dizzy;
+      const readyFire = skinnedMeshCount > 0
+        && animSummary.coverage.attacks["fighting right jab"]
+        && animSummary.coverage.attacks["fighting left jab"];
 
       const checks = {
         hasMeshes: meshCount > 0,
         hasRig: skinnedMeshCount > 0,
         humanoidBonePattern: humanoid,
-        hasIdleClip: animSummary.hasIdle,
-        hasWalkClip: animSummary.hasWalk,
-        hasGestureClip: animSummary.hasGesture,
-        hasAttackClip: animSummary.hasAttack,
+        actionCoverage: animSummary.coverage,
       };
 
       const recommendations = [];
       if (!checks.hasRig) recommendations.push("Add armature/skin for character-like control.");
-      if (!checks.hasWalkClip) recommendations.push("Add animation clip named Walk or Run.");
-      if (!checks.hasIdleClip) recommendations.push("Add animation clip named Idle.");
-      if (!checks.hasGestureClip) recommendations.push("Add gesture clip (Wave/Gesture/Emote).");
-      if (!checks.hasAttackClip) recommendations.push("Add attack/cast/shoot clip for fire or skills.");
+      for (const [groupName, group] of Object.entries(animSummary.coverage)) {
+        for (const [actionName, covered] of Object.entries(group)) {
+          if (!covered) {
+            recommendations.push("Missing clip for '" + actionName + "' in group '" + groupName + "'.");
+          }
+        }
+      }
 
       return {
         model: modelName,
@@ -1262,6 +1373,8 @@ app.get("/ui/models", (_, res) => {
           animationNames: animSummary.names,
         },
         checks,
+        matchedClipsByAction: animSummary.matchedByAction,
+        requiredActionSet: ACTION_SPEC,
         capabilityScore: {
           moveHumanLike: readyWalk,
           liftHandsOrGesture: readyGesture,
@@ -1334,12 +1447,11 @@ app.get("/ui/runtime", (_, res) => {
     <p>Spawn real uploaded models, stream AI commands, and watch movement/chat with VFX in a live 3D world.</p>
     <section class="card">
       <div class="row">
-        <button id="startSession">Start Runtime Session</button>
-        <button id="spawnActive" class="secondary">Spawn Active Character</button>
         <button id="autoMove" class="secondary">Auto Move + Chat (demo)</button>
         <button id="focusActor" class="accent">Focus Active Actor</button>
+        <button id="resetWorld" class="secondary">Reset Shared World</button>
       </div>
-      <p id="sessionInfo" class="muted">Session: not started</p>
+      <p id="sessionInfo" class="muted">Session: connecting...</p>
       <p id="runtimeStatus" class="status"></p>
       <p class="muted">Copilot/MCP should read <code>/api/mcp/context</code> and send <code>spawn</code>, <code>move_to</code>, <code>say</code> to <code>/control/:sessionId</code>.</p>
     </section>
@@ -1368,10 +1480,9 @@ app.get("/ui/runtime", (_, res) => {
     import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/loaders/GLTFLoader.js";
     window.__runtimeModuleLoaded = true;
 
-    const startSessionBtn = document.getElementById("startSession");
-    const spawnActiveBtn = document.getElementById("spawnActive");
     const autoMoveBtn = document.getElementById("autoMove");
     const focusActorBtn = document.getElementById("focusActor");
+    const resetWorldBtn = document.getElementById("resetWorld");
     const sessionInfo = document.getElementById("sessionInfo");
     const runtimeStatus = document.getElementById("runtimeStatus");
     const canvas = document.getElementById("world3d");
@@ -1674,8 +1785,10 @@ app.get("/ui/runtime", (_, res) => {
     };
 
     const loadWorld = async () => {
-      if (!sessionId) return;
-      const response = await fetch("/api/world?sessionId=" + encodeURIComponent(sessionId));
+      const url = sessionId
+        ? "/api/world?sessionId=" + encodeURIComponent(sessionId)
+        : "/api/world";
+      const response = await fetch(url);
       const data = await response.json();
       if (!response.ok) {
         setStatus("Failed to load world: " + (data.error || "unknown"), true);
@@ -1693,59 +1806,36 @@ app.get("/ui/runtime", (_, res) => {
     };
 
     const postControl = async (command) => {
-      if (!sessionId) return;
-      await fetch("/control/" + encodeURIComponent(sessionId), {
+      const url = sessionId
+        ? "/control/" + encodeURIComponent(sessionId)
+        : "/control";
+      await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(command),
       });
     };
 
-    startSessionBtn.addEventListener("click", async () => {
-      const response = await fetch("/session/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceId: "runtime-preview" }),
-      });
+    const connectSharedSession = async () => {
+      const response = await fetch("/api/session/shared");
       const data = await response.json();
       if (!response.ok) {
         sessionInfo.textContent = "Failed to start session.";
         setStatus(data.error || "Cannot start runtime session.", true);
-        return;
+        return false;
       }
       sessionId = data.sessionId;
       sessionInfo.textContent = "Session: " + sessionId;
       setStatus("Runtime session started.");
       startPolling();
       await loadWorld();
-    });
-
-    spawnActiveBtn.addEventListener("click", async () => {
-      if (!sessionId) {
-        sessionInfo.textContent = "Start session first.";
-        return;
-      }
-      const response = await fetch("/api/scene/spawn/" + encodeURIComponent(sessionId), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ position: [0, 0, 0] }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        sessionInfo.textContent = "Spawn failed: " + (data.error || "unknown");
-        setStatus(data.error || "Spawn failed.", true);
-        return;
-      }
-      sessionInfo.textContent = "Spawned active character in session " + sessionId;
-      activeContext = data.scene || activeContext;
-      setStatus("Active model spawned into 3D world.");
-      await loadWorld();
-    });
+      return true;
+    };
 
     autoMoveBtn.addEventListener("click", async () => {
       if (!sessionId) {
-        sessionInfo.textContent = "Start session first.";
-        return;
+        const ok = await connectSharedSession();
+        if (!ok) return;
       }
       const contextResponse = await fetch("/api/mcp/context");
       const context = await contextResponse.json();
@@ -1793,10 +1883,25 @@ app.get("/ui/runtime", (_, res) => {
       setStatus("Camera focused on active actor.");
     });
 
+    resetWorldBtn.addEventListener("click", async () => {
+      const ok = window.confirm("Reset shared world? This clears all spawned actors and chat history.");
+      if (!ok) return;
+      const response = await fetch("/api/world/reset", { method: "POST" });
+      const data = await response.json();
+      if (!response.ok) {
+        setStatus(data.error || "Reset failed.", true);
+        return;
+      }
+      worldState = { actors: [], chats: [] };
+      await syncActors();
+      setStatus("Shared world reset.");
+    });
+
     window.addEventListener("resize", resizeRenderer);
     resizeRenderer();
     animate();
     setStatus("3D world ready.");
+    connectSharedSession().catch(() => {});
   </script>
   <script>
     (function () {
@@ -1805,8 +1910,6 @@ app.get("/ui/runtime", (_, res) => {
         if (window.__runtimeModuleLoaded) {
           return;
         }
-        const startBtn = document.getElementById("startSession");
-        const spawnBtn = document.getElementById("spawnActive");
         const sessionInfo = document.getElementById("sessionInfo");
         const status = document.getElementById("runtimeStatus");
         status.textContent = "3D engine failed to load (CDN/module blocked). Fallback controls are active.";
@@ -1816,12 +1919,8 @@ app.get("/ui/runtime", (_, res) => {
           layer.innerHTML = '<div class="actorLabel" style="left:50%;top:52%;transform:translate(-50%,-50%);display:block;">3D renderer failed to load. Check browser console/network and disable blockers for localhost.</div>';
         }
 
-        startBtn.addEventListener("click", async function () {
-          const response = await fetch("/session/start", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ deviceId: "runtime-preview-fallback" }),
-          });
+        (async function connectFallbackSession() {
+          const response = await fetch("/api/session/shared");
           const data = await response.json();
           if (!response.ok) {
             status.textContent = "Fallback start failed: " + (data.error || "unknown");
@@ -1832,28 +1931,8 @@ app.get("/ui/runtime", (_, res) => {
           sessionInfo.textContent = "Session: " + fallbackSessionId;
           status.textContent = "Fallback session started.";
           status.style.color = "#9dd2ff";
-        });
+        })();
 
-        spawnBtn.addEventListener("click", async function () {
-          if (!fallbackSessionId) {
-            status.textContent = "Start session first.";
-            status.style.color = "#ff9da4";
-            return;
-          }
-          const response = await fetch("/api/scene/spawn/" + encodeURIComponent(fallbackSessionId), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ position: [0, 0, 0] }),
-          });
-          const data = await response.json();
-          if (!response.ok) {
-            status.textContent = "Fallback spawn failed: " + (data.error || "unknown");
-            status.style.color = "#ff9da4";
-            return;
-          }
-          status.textContent = "Fallback spawn sent.";
-          status.style.color = "#9dd2ff";
-        });
       }, 1200);
     })();
   </script>
@@ -1866,27 +1945,9 @@ app.post("/session/start", (req, res) => {
   if (!deviceId) {
     return res.status(400).json({ error: "deviceId is required" });
   }
-
   const sessionId = newSessionId();
-  const initialTimestamp = now();
-  sessions.set(sessionId, {
-    deviceId,
-    createdAt: initialTimestamp,
-    lastSeenAt: initialTimestamp,
-    cursor: 0,
-  });
-  commandQueues.set(sessionId, []);
-  acknowledgements.set(sessionId, []);
-  worldStates.set(sessionId, { actors: new Map(), chats: [] });
-
-  res.status(201).json({
-    sessionId,
-    polling: {
-      minMs: 300,
-      maxMs: 2000,
-      suggestedMs: 500,
-    },
-  });
+  const payload = createSessionRecord(sessionId, deviceId);
+  res.status(201).json(payload);
 });
 
 app.post("/events", requireSession, (req, res) => {
@@ -1947,7 +2008,7 @@ app.post("/ack", requireSession, (req, res) => {
 });
 
 app.post("/control/:sessionId", (req, res) => {
-  const { sessionId } = req.params;
+  const sessionId = resolveSessionIdInput(req.params.sessionId);
   if (!sessions.has(sessionId)) {
     return res.status(404).json({ error: "session not found" });
   }
@@ -1956,10 +2017,47 @@ app.post("/control/:sessionId", (req, res) => {
   if (!type) {
     return res.status(400).json({ error: "type is required" });
   }
-
-  const command = enqueueCommand(sessionId, type, payload);
-  res.status(201).json({ command });
+  Promise.resolve()
+    .then(async () => {
+      const nextPayload = { ...payload };
+      if (type === "move_to" || type === "say") {
+        const resolvedActorId = await resolveActorIdFromPayload(sessionId, payload);
+        if (resolvedActorId) {
+          nextPayload.actorId = resolvedActorId;
+        }
+      }
+      const command = enqueueCommand(sessionId, type, nextPayload);
+      res.status(201).json({ command });
+    })
+    .catch((error) => {
+      res.status(400).json({ error: error.message || "control command failed" });
+    });
 });
+
+app.post("/control", (req, res) => {
+  const sessionId = ensureSharedSession();
+  const { type, payload = {} } = req.body || {};
+  if (!type) {
+    return res.status(400).json({ error: "type is required" });
+  }
+  Promise.resolve()
+    .then(async () => {
+      const nextPayload = { ...payload };
+      if (type === "move_to" || type === "say") {
+        const resolvedActorId = await resolveActorIdFromPayload(sessionId, payload);
+        if (resolvedActorId) {
+          nextPayload.actorId = resolvedActorId;
+        }
+      }
+      const command = enqueueCommand(sessionId, type, nextPayload);
+      res.status(201).json({ command, sessionId, shared: true });
+    })
+    .catch((error) => {
+      res.status(400).json({ error: error.message || "control command failed" });
+    });
+});
+
+ensureSharedSession();
 
 app.listen(PORT, () => {
   console.log(`Orchestrator server running on http://localhost:${PORT}`);

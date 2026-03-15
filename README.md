@@ -21,6 +21,8 @@ Step-by-step guide to:
 
 ## Quick Start (Full Flow)
 
+Default mode is now **shared session**. You do not need to manage session IDs manually for MCP/runtime common flow.
+
 ### 1) Install dependencies
 
 From repo root:
@@ -104,7 +106,7 @@ You now have a live session ID in runtime preview.
 
 In Copilot Chat, ask it to use MCP tools in this order:
 1. `get_context`
-2. `start_session` (or reuse runtime session)
+2. `get_shared_session` (or skip; other tools auto-use shared session)
 3. `spawn_active`
 4. repeated `send_command` with `move_to` and `say`
 5. `get_world` to verify actor state/chat history
@@ -112,7 +114,9 @@ In Copilot Chat, ask it to use MCP tools in this order:
 Available MCP tools:
 - `get_context`
 - `start_session`
+- `get_shared_session`
 - `spawn_active`
+- `spawn_avatar`
 - `send_command`
 - `get_world`
 - `list_models`
