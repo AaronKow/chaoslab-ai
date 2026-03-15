@@ -31,7 +31,7 @@ const sessions = new Map();
 const commandQueues = new Map();
 /** @type {Map<string, Array<{commandId: number, executedAt: number, status: string, details?: string}>>} */
 const acknowledgements = new Map();
-/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], lastUpdatedAt: number, lastChat?: string}>, chats: Array<{actorId: string, text: string, at: number}>}>} */
+/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], moveTarget?: [number, number, number] | null, movementSpeed?: number, locomotionMode?: string, currentAnimation?: string, actionUntil?: number, activeMoveId?: number, lastCompletedMoveId?: number, lastUpdatedAt: number, lastChat?: string}>, chats: Array<{actorId: string, text: string, at: number}>, arrivals: Array<{actorId: string, moveId: number, at: number, position: [number, number, number]}>, lastAdvanceAt: number}>} */
 const worldStates = new Map();
 
 const newSessionId = () => crypto.randomUUID();
@@ -223,7 +223,7 @@ function createSessionRecord(sessionId, deviceId) {
   });
   commandQueues.set(sessionId, []);
   acknowledgements.set(sessionId, []);
-  worldStates.set(sessionId, { actors: new Map(), chats: [] });
+  worldStates.set(sessionId, { actors: new Map(), chats: [], arrivals: [], lastAdvanceAt: now() });
   return {
     sessionId,
     polling: {
@@ -269,6 +269,8 @@ function ensureWorldState(sessionId) {
     worldStates.set(sessionId, {
       actors: new Map(),
       chats: [],
+      arrivals: [],
+      lastAdvanceAt: now(),
     });
   }
   return worldStates.get(sessionId);
@@ -312,8 +314,109 @@ function extractActionTag(text) {
   return toSafeText(match?.[1] || "");
 }
 
+function chooseBackendLocomotion() {
+  const sprint = Math.random() < 0.3;
+  if (sprint) {
+    return {
+      mode: "sprint",
+      speed: Number((2.0 + Math.random() * 0.6).toFixed(2)),
+      clip: "sprint loop",
+    };
+  }
+  return {
+    mode: "walk",
+    speed: Number((1.0 + Math.random() * 0.4).toFixed(2)),
+    clip: "walk loop",
+  };
+}
+
+function advanceWorldState(sessionId, at = now()) {
+  const world = ensureWorldState(sessionId);
+  const previous = Number(world.lastAdvanceAt || at);
+  const deltaMs = Math.max(0, at - previous);
+  world.lastAdvanceAt = at;
+  if (deltaMs <= 0) {
+    return;
+  }
+
+  for (const actor of world.actors.values()) {
+    const target = Array.isArray(actor.moveTarget) ? actor.moveTarget : null;
+    if (!target) {
+      continue;
+    }
+    const cx = Number(actor.position?.[0] || 0);
+    const cy = Number(actor.position?.[1] || 0);
+    const cz = Number(actor.position?.[2] || 0);
+    const tx = Number(target[0] || 0);
+    const ty = Number(target[1] || 0);
+    const tz = Number(target[2] || 0);
+    const dx = tx - cx;
+    const dy = ty - cy;
+    const dz = tz - cz;
+    const distance = Math.hypot(dx, dy, dz);
+
+    if (distance <= 0.001) {
+      actor.position = [tx, ty, tz];
+      actor.moveTarget = null;
+      if (Number(actor.activeMoveId || 0) > Number(actor.lastCompletedMoveId || 0)) {
+        actor.lastCompletedMoveId = actor.activeMoveId;
+        world.arrivals.push({
+          actorId: actor.actorId,
+          moveId: actor.activeMoveId,
+          at,
+          position: [tx, ty, tz],
+        });
+        if (world.arrivals.length > 80) {
+          world.arrivals = world.arrivals.slice(-80);
+        }
+      }
+      if ((actor.actionUntil || 0) <= at) {
+        actor.currentAnimation = "idle loop";
+      }
+      actor.lastUpdatedAt = at;
+      continue;
+    }
+
+    const speed = normalizeSpeed(actor.movementSpeed, 1);
+    const step = speed * (deltaMs / 1000);
+    if (step >= distance) {
+      actor.position = [tx, ty, tz];
+      actor.moveTarget = null;
+      if (Number(actor.activeMoveId || 0) > Number(actor.lastCompletedMoveId || 0)) {
+        actor.lastCompletedMoveId = actor.activeMoveId;
+        world.arrivals.push({
+          actorId: actor.actorId,
+          moveId: actor.activeMoveId,
+          at,
+          position: [tx, ty, tz],
+        });
+        if (world.arrivals.length > 80) {
+          world.arrivals = world.arrivals.slice(-80);
+        }
+      }
+      if ((actor.actionUntil || 0) <= at) {
+        actor.currentAnimation = "idle loop";
+      }
+      actor.lastUpdatedAt = at;
+      continue;
+    }
+
+    const ratio = step / distance;
+    actor.position = [
+      cx + dx * ratio,
+      cy + dy * ratio,
+      cz + dz * ratio,
+    ];
+    if ((actor.actionUntil || 0) <= at) {
+      actor.currentAnimation = inferLocomotionClip(speed);
+    }
+    actor.lastUpdatedAt = at;
+  }
+}
+
 function applyCommandToWorld(sessionId, type, payload) {
   const world = ensureWorldState(sessionId);
+  advanceWorldState(sessionId);
   const actorId = toSafeText(payload?.actorId);
   if (!actorId) {
     return;
@@ -349,9 +452,13 @@ function applyCommandToWorld(sessionId, type, payload) {
       name: nextName,
       role: toSafeText(payload?.role, currentActor?.role || ""),
       position: normalizePosition(payload?.position),
+      moveTarget: null,
       movementSpeed: normalizeSpeed(payload?.speed, currentActor?.movementSpeed || 1),
+      locomotionMode: toSafeText(payload?.locomotionMode, currentActor?.locomotionMode || "walk"),
       currentAnimation: toSafeText(payload?.animation, currentActor?.currentAnimation || "idle loop"),
       actionUntil: currentActor?.actionUntil || 0,
+      activeMoveId: Number(currentActor?.activeMoveId || 0),
+      lastCompletedMoveId: Number(currentActor?.lastCompletedMoveId || 0),
       lastUpdatedAt: now(),
       lastChat: currentActor?.lastChat || "",
     });
@@ -362,10 +469,13 @@ function applyCommandToWorld(sessionId, type, payload) {
     if (!currentActor) {
       return;
     }
-    const speed = normalizeSpeed(payload?.speed, currentActor.movementSpeed || 1);
-    currentActor.position = normalizePosition(payload?.position);
-    currentActor.movementSpeed = speed;
-    currentActor.currentAnimation = inferLocomotionClip(speed);
+    const profile = chooseBackendLocomotion();
+    const nextMoveId = Number(currentActor.activeMoveId || 0) + 1;
+    currentActor.moveTarget = normalizePosition(payload?.position);
+    currentActor.activeMoveId = nextMoveId;
+    currentActor.movementSpeed = profile.speed;
+    currentActor.locomotionMode = profile.mode;
+    currentActor.currentAnimation = profile.clip;
     currentActor.lastUpdatedAt = now();
     world.actors.set(actorId, currentActor);
     return;
@@ -636,15 +746,16 @@ app.get("/api/mcp/context", async (_, res) => {
       commandSchema: [
         { type: "spawn", payload: { actorId: "string", modelName: "string", characterId: "string(optional)", name: "string(optional)", role: "string(optional)", position: "[x,y,z]" } },
         { type: "say", payload: { actorId: "string", text: "string", bubbleTtlMs: "number(optional)" } },
-        { type: "move_to", payload: { actorId: "string", position: "[x,y,z]", speed: "number(optional)" } },
+        { type: "move_to", payload: { actorId: "string", position: "[x,y,z]" } },
         { type: "play_animation", payload: { actorId: "string", clip: "string", durationMs: "number(optional)" } },
       ],
       targetEndpoint: "POST /control (shared session default) or POST /control/:sessionId",
       autonomyLoop: [
         "Read /api/mcp/context.",
         "Ensure active character is spawned once with POST /api/scene/spawn (shared).",
-        "When moving, always send move_to with speed and matching locomotion animation intent.",
+        "When moving, send move_to with destination only. Backend chooses walk/sprint and speed automatically.",
         "When acting, send play_animation with clip names from the inspected model.",
+        "Poll /api/world and use arrivals callbacks to know when destination has been reached.",
         "Then continuously send move_to/say/play_animation to POST /control for the same actorId.",
       ],
       animationPolicy: {
@@ -663,7 +774,7 @@ app.get("/api/mcp/context", async (_, res) => {
           "backflip",
           "meditate",
         ],
-        instruction: "Prefer exact clip names from Model Capability Inspector. Use [action:<name>] tags in say text for traceability.",
+        instruction: "Backend chooses walk/sprint automatically on move_to (70/30). AI should not set speed for locomotion. Use [action:<name>] tags in say text for traceability.",
       },
     });
   } catch (error) {
@@ -672,6 +783,7 @@ app.get("/api/mcp/context", async (_, res) => {
 });
 
 app.get("/api/world", requireSession, (req, res) => {
+  advanceWorldState(req.sessionId);
   const world = ensureWorldState(req.sessionId);
   const currentTime = now();
   for (const actor of world.actors.values()) {
@@ -685,13 +797,14 @@ app.get("/api/world", requireSession, (req, res) => {
     sessionId: req.sessionId,
     actors: Array.from(world.actors.values()),
     chats: world.chats,
+    arrivals: world.arrivals,
     updatedAt: now(),
   });
 });
 
 app.post("/api/world/reset", (req, res) => {
   const sessionId = ensureSharedSession();
-  worldStates.set(sessionId, { actors: new Map(), chats: [] });
+  worldStates.set(sessionId, { actors: new Map(), chats: [], arrivals: [], lastAdvanceAt: now() });
   commandQueues.set(sessionId, []);
   acknowledgements.set(sessionId, []);
   const session = sessions.get(sessionId);
@@ -2010,7 +2123,7 @@ app.get("/ui/runtime", (_, res) => {
       controls.update();
 
       for (const entity of actorEntities.values()) {
-        const follow = Math.min(0.24, Math.max(0.07, (entity.targetSpeed || 1) * 0.08));
+        const follow = Math.min(0.2, Math.max(0.05, (entity.targetSpeed || 1) * 0.06));
         entity.root.position.lerp(entity.targetPosition, follow);
         const dir = entity.targetPosition.clone().sub(entity.root.position);
         if (dir.lengthSq() > 0.001) {
@@ -2129,8 +2242,6 @@ app.get("/ui/runtime", (_, res) => {
       autoTimer = setInterval(async () => {
         const x = (Math.random() * 8) - 4;
         const z = (Math.random() * 8) - 4;
-        const speed = Math.random() > 0.5 ? 2.1 : 1.1;
-        const locomotion = speed >= 1.8 ? "sprint loop" : "walk loop";
         const lines = [
           "[action:dance loop] Scanning the area.",
           "[action:defend] I will guide you forward.",
@@ -2139,8 +2250,7 @@ app.get("/ui/runtime", (_, res) => {
           "[action:meditate] Switching route to objective.",
         ];
         const text = lines[Math.floor(Math.random() * lines.length)];
-        await postControl({ type: "play_animation", payload: { actorId, clip: locomotion, durationMs: 1400 } });
-        await postControl({ type: "move_to", payload: { actorId, position: [x, 0, z], speed } });
+        await postControl({ type: "move_to", payload: { actorId, position: [x, 0, z] } });
         await postControl({ type: "say", payload: { actorId, text, bubbleTtlMs: 2600 } });
       }, 2200);
     });

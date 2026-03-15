@@ -144,17 +144,6 @@ function normalizeText(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-function inferLocomotionClip(speedValue) {
-  const speed = Number(speedValue);
-  if (Number.isFinite(speed) && speed >= 1.8) {
-    return "sprint loop";
-  }
-  if (Number.isFinite(speed) && speed >= 0.4) {
-    return "walk loop";
-  }
-  return "idle loop";
-}
-
 function extractActionTag(text) {
   const value = String(text || "");
   const match = value.match(/\[action:([^\]]+)\]/i);
@@ -285,33 +274,25 @@ async function handleToolCall(name, args) {
     const sessionId = resolved.sessionId;
     const type = requireString("type", args.type);
     const payload = isObject(args.payload) ? args.payload : {};
+    const nextPayload = { ...payload };
+    if (type === "move_to" && "speed" in nextPayload) {
+      // Backend owns locomotion speed profile (70% walk / 30% sprint).
+      delete nextPayload.speed;
+    }
+    if (type === "move_to" && "locomotionMode" in nextPayload) {
+      // Backend also decides walk vs sprint mode.
+      delete nextPayload.locomotionMode;
+    }
+
     const response = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type, payload }),
+      body: JSON.stringify({ type, payload: nextPayload }),
     });
 
     const automation = [];
-    if (type === "move_to") {
-      const clip = inferLocomotionClip(payload.speed);
-      const animResponse = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          type: "play_animation",
-          payload: {
-            actorId: payload.actorId,
-            characterId: payload.characterId,
-            name: payload.name,
-            clip,
-            durationMs: 1400,
-          },
-        }),
-      });
-      automation.push({ reason: "locomotion", clip, response: animResponse.body });
-    }
     if (type === "say") {
-      const tag = extractActionTag(payload.text);
+      const tag = extractActionTag(nextPayload.text);
       if (tag) {
         const animResponse = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
           method: "POST",
@@ -319,9 +300,9 @@ async function handleToolCall(name, args) {
           body: JSON.stringify({
             type: "play_animation",
             payload: {
-              actorId: payload.actorId,
-              characterId: payload.characterId,
-              name: payload.name,
+              actorId: nextPayload.actorId,
+              characterId: nextPayload.characterId,
+              name: nextPayload.name,
               clip: tag,
               durationMs: 2400,
             },
