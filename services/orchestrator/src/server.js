@@ -252,15 +252,16 @@ function ensureSharedSession() {
 
 function enqueueCommand(sessionId, type, payload) {
   const session = sessions.get(sessionId);
-  session.cursor += 1;
+  const appliedPayload = applyCommandToWorld(sessionId, type, payload) || payload;
+  const nextId = session.cursor + 1;
   const nextCommand = {
-    id: session.cursor,
+    id: nextId,
     type,
-    payload,
+    payload: appliedPayload,
     createdAt: now(),
   };
+  session.cursor = nextId;
   commandQueues.get(sessionId).push(nextCommand);
-  applyCommandToWorld(sessionId, type, payload);
   return nextCommand;
 }
 
@@ -296,6 +297,16 @@ function normalizeSpeed(rawSpeed, fallback = 1) {
     return fallback;
   }
   return speed;
+}
+
+function makeRandomActorId(world, baseRaw) {
+  const base = sanitizeFilename(toSafeText(baseRaw)) || "actor";
+  let actorId = "";
+  do {
+    const rand = crypto.randomBytes(3).toString("hex");
+    actorId = `${base}-${rand}`;
+  } while (world.actors.has(actorId));
+  return actorId;
 }
 
 function inferLocomotionClip(speed) {
@@ -417,33 +428,21 @@ function advanceWorldState(sessionId, at = now()) {
 function applyCommandToWorld(sessionId, type, payload) {
   const world = ensureWorldState(sessionId);
   advanceWorldState(sessionId);
-  const actorId = toSafeText(payload?.actorId);
-  if (!actorId) {
+  const requestedActorId = toSafeText(payload?.actorId);
+  if (!requestedActorId && type !== "spawn") {
     return;
   }
-  const currentActor = world.actors.get(actorId);
+  const currentActor = requestedActorId ? world.actors.get(requestedActorId) : null;
 
   if (type === "spawn") {
+    const generatedBaseActorId = toSafeText(payload?.characterId) || toSafeText(payload?.name) || toSafeText(payload?.modelName) || "actor";
+    const allowReuse = Boolean(payload?.reuseActorId) && Boolean(currentActor);
+    const actorId = allowReuse
+      ? toSafeText(currentActor.actorId, generatedBaseActorId)
+      : makeRandomActorId(world, generatedBaseActorId);
     const nextCharacterId = toSafeText(payload?.characterId, currentActor?.characterId || "");
     const nextModelName = toSafeText(payload?.modelName, currentActor?.modelName || "");
     const nextName = toSafeText(payload?.name, currentActor?.name || actorId);
-
-    // Prevent duplicate avatars for the same character/model when AI spawns repeatedly.
-    for (const [existingActorId, existingActor] of world.actors.entries()) {
-      if (existingActorId === actorId) {
-        continue;
-      }
-      const sameCharacter =
-        nextCharacterId
-        && toSafeText(existingActor.characterId) === nextCharacterId;
-      const sameNameAndModel =
-        nextName
-        && toSafeText(existingActor.name) === nextName
-        && toSafeText(existingActor.modelName) === nextModelName;
-      if (sameCharacter || sameNameAndModel) {
-        world.actors.delete(existingActorId);
-      }
-    }
 
     world.actors.set(actorId, {
       actorId,
@@ -462,7 +461,10 @@ function applyCommandToWorld(sessionId, type, payload) {
       lastUpdatedAt: now(),
       lastChat: currentActor?.lastChat || "",
     });
-    return;
+    return {
+      ...payload,
+      actorId,
+    };
   }
 
   if (type === "move_to") {
@@ -477,8 +479,8 @@ function applyCommandToWorld(sessionId, type, payload) {
     currentActor.locomotionMode = profile.mode;
     currentActor.currentAnimation = profile.clip;
     currentActor.lastUpdatedAt = now();
-    world.actors.set(actorId, currentActor);
-    return;
+    world.actors.set(requestedActorId, currentActor);
+    return payload;
   }
 
   if (type === "say") {
@@ -492,17 +494,17 @@ function applyCommandToWorld(sessionId, type, payload) {
         currentActor.currentAnimation = inferLocomotionClip(currentActor.movementSpeed || 1);
       }
       currentActor.lastUpdatedAt = now();
-      world.actors.set(actorId, currentActor);
+      world.actors.set(requestedActorId, currentActor);
     }
     world.chats.push({
-      actorId,
+      actorId: requestedActorId,
       text: toSafeText(payload?.text),
       at: now(),
     });
     if (world.chats.length > 50) {
       world.chats = world.chats.slice(-50);
     }
-    return;
+    return payload;
   }
 
   if (type === "play_animation") {
@@ -516,8 +518,11 @@ function applyCommandToWorld(sessionId, type, payload) {
     currentActor.currentAnimation = clip;
     currentActor.actionUntil = now() + Math.max(400, Number(payload?.durationMs) || 2200);
     currentActor.lastUpdatedAt = now();
-    world.actors.set(actorId, currentActor);
+    world.actors.set(requestedActorId, currentActor);
+    return payload;
   }
+
+  return payload;
 }
 
 async function resolveActorIdFromPayload(sessionId, payload) {
@@ -752,11 +757,11 @@ app.get("/api/mcp/context", async (_, res) => {
       targetEndpoint: "POST /control (shared session default) or POST /control/:sessionId",
       autonomyLoop: [
         "Read /api/mcp/context.",
-        "Ensure active character is spawned once with POST /api/scene/spawn (shared).",
+        "Spawn with preferred actorId per agent (for example dora-rock); backend auto-assigns unique ids like dora-rock-2 when needed.",
         "When moving, send move_to with destination only. Backend chooses walk/sprint and speed automatically.",
         "When acting, send play_animation with clip names from the inspected model.",
         "Poll /api/world and use arrivals callbacks to know when destination has been reached.",
-        "Then continuously send move_to/say/play_animation to POST /control for the same actorId.",
+        "Then continuously send move_to/say/play_animation to POST /control for the same assigned actorId.",
       ],
       animationPolicy: {
         requiredLocomotion: ["idle loop", "walk loop", "sprint loop"],
@@ -2062,31 +2067,10 @@ app.get("/ui/runtime", (_, res) => {
     };
 
     const syncActors = async () => {
-      const activeActorId = activeCharacterRef?.actorId || "";
-      const activeCharacterId = activeCharacterRef?.id || "";
-
       const sourceActors = Array.isArray(worldState.actors) ? worldState.actors : [];
-      const scopedActors = (activeActorId || activeCharacterId)
-        ? sourceActors.filter((actor) => {
-            if (activeActorId && actor.actorId === activeActorId) return true;
-            if (activeCharacterId && actor.characterId === activeCharacterId) return true;
-            return false;
-          })
-        : sourceActors;
-
-      // Safety net: never render duplicate bodies for same name+model pair.
-      const dedupedMap = new Map();
-      for (const actor of scopedActors) {
-        const key = (actor.name || actor.actorId) + "::" + (actor.modelName || "");
-        const current = dedupedMap.get(key);
-        if (!current || Number(actor.lastUpdatedAt || 0) >= Number(current.lastUpdatedAt || 0)) {
-          dedupedMap.set(key, actor);
-        }
-      }
-      const filteredActors = Array.from(dedupedMap.values());
 
       const nextIds = new Set();
-      for (const actor of filteredActors) {
+      for (const actor of sourceActors) {
         if (!actor?.actorId) continue;
         nextIds.add(actor.actorId);
         const entity = await getOrCreateActorEntity(actor);

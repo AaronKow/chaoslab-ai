@@ -26,11 +26,11 @@ const toolSchemas = [
   },
   {
     name: "spawn_avatar",
-    description: "Spawn a specific avatar (character id or name). Recommended tool for AI control.",
+    description: "Spawn a specific avatar (character id or name). Server assigns actorId automatically.",
     inputSchema: {
       type: "object",
       required: ["character"],
-      additionalProperties: false,
+      additionalProperties: true,
       properties: {
         sessionId: { type: "string", description: "Optional. Defaults to shared session." },
         character: {
@@ -42,6 +42,10 @@ const toolSchemas = [
           minItems: 3,
           maxItems: 3,
           items: { type: "number" },
+        },
+        payload: {
+          type: "object",
+          description: "Optional nested payload accepted for compatibility. actorId/position/character can be read from here.",
         },
       },
     },
@@ -140,6 +144,36 @@ function optionalString(value) {
   return value.trim();
 }
 
+function readArgText(args, keys) {
+  for (const key of keys) {
+    const value = optionalString(args?.[key]);
+    if (value) {
+      return value;
+    }
+  }
+  if (isObject(args?.payload)) {
+    for (const key of keys) {
+      const value = optionalString(args.payload?.[key]);
+      if (value) {
+        return value;
+      }
+    }
+  }
+  return "";
+}
+
+function readArgPosition(args) {
+  const direct = Array.isArray(args?.position) ? args.position : null;
+  if (direct && direct.length >= 3) {
+    return direct;
+  }
+  const nested = isObject(args?.payload) && Array.isArray(args.payload?.position) ? args.payload.position : null;
+  if (nested && nested.length >= 3) {
+    return nested;
+  }
+  return [0, 0, 0];
+}
+
 function normalizeText(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -232,7 +266,7 @@ async function handleToolCall(name, args) {
   if (name === "spawn_avatar") {
     const resolved = await resolveSessionId(args.sessionId);
     const sessionId = resolved.sessionId;
-    const characterQuery = requireString("character", args.character);
+    const characterQuery = requireString("character", readArgText(args, ["character"]));
 
     const modelsResponse = await orchestratorRequest("/api/models");
     if (!modelsResponse.ok) {
@@ -242,26 +276,29 @@ async function handleToolCall(name, args) {
     if (!picked) {
       throw new Error(`Character not found: ${characterQuery}`);
     }
-
     const response = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         type: "spawn",
         payload: {
-          actorId: picked.character.actorId || picked.character.id,
           modelName: picked.model.name,
           characterId: picked.character.id || "",
           name: picked.character.name || picked.character.id || "Character",
           role: picked.character.role || "",
-          position: Array.isArray(args.position) ? args.position : [0, 0, 0],
+          position: readArgPosition(args),
         },
       }),
     });
+    if (!response.ok) {
+      const message = response.body?.error || `spawn_avatar failed (${response.status})`;
+      throw new Error(message);
+    }
     return asTextResult({
       ...response.body,
       sessionId,
       sharedSessionFallback: resolved.shared,
+      actorId: response.body?.command?.payload?.actorId || "",
       selectedCharacter: {
         query: characterQuery,
         matchedModel: picked.model.name,
@@ -275,6 +312,9 @@ async function handleToolCall(name, args) {
     const type = requireString("type", args.type);
     const payload = isObject(args.payload) ? args.payload : {};
     const nextPayload = { ...payload };
+    if ((type === "move_to" || type === "say" || type === "play_animation") && !optionalString(nextPayload.actorId)) {
+      throw new Error(`${type} requires payload.actorId. Use the actorId returned by spawn_avatar.`);
+    }
     if (type === "move_to" && "speed" in nextPayload) {
       // Backend owns locomotion speed profile (70% walk / 30% sprint).
       delete nextPayload.speed;
