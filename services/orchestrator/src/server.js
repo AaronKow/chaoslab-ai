@@ -321,11 +321,32 @@ function applyCommandToWorld(sessionId, type, payload) {
   const currentActor = world.actors.get(actorId);
 
   if (type === "spawn") {
+    const nextCharacterId = toSafeText(payload?.characterId, currentActor?.characterId || "");
+    const nextModelName = toSafeText(payload?.modelName, currentActor?.modelName || "");
+    const nextName = toSafeText(payload?.name, currentActor?.name || actorId);
+
+    // Prevent duplicate avatars for the same character/model when AI spawns repeatedly.
+    for (const [existingActorId, existingActor] of world.actors.entries()) {
+      if (existingActorId === actorId) {
+        continue;
+      }
+      const sameCharacter =
+        nextCharacterId
+        && toSafeText(existingActor.characterId) === nextCharacterId;
+      const sameNameAndModel =
+        nextName
+        && toSafeText(existingActor.name) === nextName
+        && toSafeText(existingActor.modelName) === nextModelName;
+      if (sameCharacter || sameNameAndModel) {
+        world.actors.delete(existingActorId);
+      }
+    }
+
     world.actors.set(actorId, {
       actorId,
-      modelName: toSafeText(payload?.modelName, currentActor?.modelName || ""),
-      characterId: toSafeText(payload?.characterId, currentActor?.characterId || ""),
-      name: toSafeText(payload?.name, currentActor?.name || actorId),
+      modelName: nextModelName,
+      characterId: nextCharacterId,
+      name: nextName,
       role: toSafeText(payload?.role, currentActor?.role || ""),
       position: normalizePosition(payload?.position),
       movementSpeed: normalizeSpeed(payload?.speed, currentActor?.movementSpeed || 1),
@@ -1577,6 +1598,7 @@ app.get("/ui/runtime", (_, res) => {
     let pollingTimer = null;
     let autoTimer = null;
     let activeContext = null;
+    let activeCharacterRef = null;
 
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -1622,8 +1644,10 @@ app.get("/ui/runtime", (_, res) => {
     const loader = new GLTFLoader();
     const modelCache = new Map();
     const actorEntities = new Map();
+    const pendingActorCreates = new Map();
     const pointer = new THREE.Vector3();
     const clock = new THREE.Clock();
+    let worldSyncInFlight = false;
 
     const setStatus = (text, isError = false) => {
       runtimeStatus.textContent = text;
@@ -1807,8 +1831,45 @@ app.get("/ui/runtime", (_, res) => {
       };
     };
 
+    const removeActorEntity = (entity) => {
+      if (!entity) return;
+      scene.remove(entity.root);
+      scene.remove(entity.trail.line);
+      entity.label.remove();
+      entity.chat.remove();
+      if (entity.mixer) {
+        entity.mixer.stopAllAction();
+      }
+    };
+
+    const getOrCreateActorEntity = async (actor) => {
+      const existing = actorEntities.get(actor.actorId);
+      if (existing) {
+        return existing;
+      }
+      if (pendingActorCreates.has(actor.actorId)) {
+        return pendingActorCreates.get(actor.actorId);
+      }
+      const creation = createActorEntity(actor)
+        .then((created) => {
+          const already = actorEntities.get(actor.actorId);
+          if (already) {
+            // Another async pass already registered one; discard this duplicate.
+            removeActorEntity(created);
+            return already;
+          }
+          actorEntities.set(actor.actorId, created);
+          return created;
+        })
+        .finally(() => {
+          pendingActorCreates.delete(actor.actorId);
+        });
+      pendingActorCreates.set(actor.actorId, creation);
+      return creation;
+    };
+
     const updateLabel = (entity, actor) => {
-      entity.label.textContent = (actor.name || actor.actorId) + " · " + (actor.role || "actor");
+      entity.label.textContent = actor.name || actor.actorId;
     };
 
     const showChat = (entity, text) => {
@@ -1876,16 +1937,46 @@ app.get("/ui/runtime", (_, res) => {
       });
     };
 
+    const refreshActiveCharacterRef = async () => {
+      try {
+        const response = await fetch("/api/mcp/context");
+        const data = await response.json();
+        activeContext = data;
+        activeCharacterRef = data?.scene?.activeCharacter || null;
+      } catch {
+        // Keep last known active reference if context fetch fails.
+      }
+    };
+
     const syncActors = async () => {
+      const activeActorId = activeCharacterRef?.actorId || "";
+      const activeCharacterId = activeCharacterRef?.id || "";
+
+      const sourceActors = Array.isArray(worldState.actors) ? worldState.actors : [];
+      const scopedActors = (activeActorId || activeCharacterId)
+        ? sourceActors.filter((actor) => {
+            if (activeActorId && actor.actorId === activeActorId) return true;
+            if (activeCharacterId && actor.characterId === activeCharacterId) return true;
+            return false;
+          })
+        : sourceActors;
+
+      // Safety net: never render duplicate bodies for same name+model pair.
+      const dedupedMap = new Map();
+      for (const actor of scopedActors) {
+        const key = (actor.name || actor.actorId) + "::" + (actor.modelName || "");
+        const current = dedupedMap.get(key);
+        if (!current || Number(actor.lastUpdatedAt || 0) >= Number(current.lastUpdatedAt || 0)) {
+          dedupedMap.set(key, actor);
+        }
+      }
+      const filteredActors = Array.from(dedupedMap.values());
+
       const nextIds = new Set();
-      for (const actor of worldState.actors || []) {
+      for (const actor of filteredActors) {
         if (!actor?.actorId) continue;
         nextIds.add(actor.actorId);
-        let entity = actorEntities.get(actor.actorId);
-        if (!entity) {
-          entity = await createActorEntity(actor);
-          actorEntities.set(actor.actorId, entity);
-        }
+        const entity = await getOrCreateActorEntity(actor);
         entity.targetPosition.copy(toVec3(actor.position));
         entity.targetSpeed = Number(actor.movementSpeed || 1);
         entity.requestedAnimation = normalizeClipName(actor.currentAnimation || "idle loop");
@@ -1898,10 +1989,7 @@ app.get("/ui/runtime", (_, res) => {
       }
       for (const [actorId, entity] of actorEntities.entries()) {
         if (nextIds.has(actorId)) continue;
-        scene.remove(entity.root);
-        scene.remove(entity.trail.line);
-        entity.label.remove();
-        entity.chat.remove();
+        removeActorEntity(entity);
         actorEntities.delete(actorId);
       }
       renderChats();
@@ -1958,6 +2046,12 @@ app.get("/ui/runtime", (_, res) => {
     };
 
     const loadWorld = async () => {
+      if (worldSyncInFlight) {
+        return;
+      }
+      worldSyncInFlight = true;
+      try {
+      await refreshActiveCharacterRef();
       const url = sessionId
         ? "/api/world?sessionId=" + encodeURIComponent(sessionId)
         : "/api/world";
@@ -1969,6 +2063,9 @@ app.get("/ui/runtime", (_, res) => {
       }
       worldState = data;
       await syncActors();
+      } finally {
+        worldSyncInFlight = false;
+      }
     };
 
     const startPolling = () => {
@@ -2014,6 +2111,7 @@ app.get("/ui/runtime", (_, res) => {
       const context = await contextResponse.json();
       const actorId = context?.scene?.activeCharacter?.actorId;
       activeContext = context;
+      activeCharacterRef = context?.scene?.activeCharacter || null;
       if (!actorId) {
         sessionInfo.textContent = "Set active character in /ui/models first.";
         setStatus("No active character found.", true);
