@@ -144,6 +144,23 @@ function normalizeText(value) {
   return String(value || "").trim().toLowerCase();
 }
 
+function inferLocomotionClip(speedValue) {
+  const speed = Number(speedValue);
+  if (Number.isFinite(speed) && speed >= 1.8) {
+    return "sprint loop";
+  }
+  if (Number.isFinite(speed) && speed >= 0.4) {
+    return "walk loop";
+  }
+  return "idle loop";
+}
+
+function extractActionTag(text) {
+  const value = String(text || "");
+  const match = value.match(/\[action:([^\]]+)\]/i);
+  return match ? match[1].trim() : "";
+}
+
 function pickCharacterFromModels(modelsPayload, query) {
   const models = Array.isArray(modelsPayload?.models) ? modelsPayload.models : [];
   const wanted = normalizeText(query);
@@ -273,7 +290,53 @@ async function handleToolCall(name, args) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ type, payload }),
     });
-    return asTextResult({ ...response.body, sessionId, sharedSessionFallback: resolved.shared });
+
+    const automation = [];
+    if (type === "move_to") {
+      const clip = inferLocomotionClip(payload.speed);
+      const animResponse = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "play_animation",
+          payload: {
+            actorId: payload.actorId,
+            characterId: payload.characterId,
+            name: payload.name,
+            clip,
+            durationMs: 1400,
+          },
+        }),
+      });
+      automation.push({ reason: "locomotion", clip, response: animResponse.body });
+    }
+    if (type === "say") {
+      const tag = extractActionTag(payload.text);
+      if (tag) {
+        const animResponse = await orchestratorRequest(`/control/${encodeURIComponent(sessionId)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "play_animation",
+            payload: {
+              actorId: payload.actorId,
+              characterId: payload.characterId,
+              name: payload.name,
+              clip: tag,
+              durationMs: 2400,
+            },
+          }),
+        });
+        automation.push({ reason: "action_tag", clip: tag, response: animResponse.body });
+      }
+    }
+
+    return asTextResult({
+      ...response.body,
+      sessionId,
+      sharedSessionFallback: resolved.shared,
+      animationAutomation: automation,
+    });
   }
   if (name === "get_world") {
     const resolved = await resolveSessionId(args.sessionId);

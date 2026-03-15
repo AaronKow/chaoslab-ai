@@ -288,6 +288,30 @@ function normalizePosition(raw) {
   ];
 }
 
+function normalizeSpeed(rawSpeed, fallback = 1) {
+  const speed = Number(rawSpeed);
+  if (!Number.isFinite(speed) || speed <= 0) {
+    return fallback;
+  }
+  return speed;
+}
+
+function inferLocomotionClip(speed) {
+  if (speed >= 1.8) {
+    return "sprint loop";
+  }
+  if (speed >= 0.4) {
+    return "walk loop";
+  }
+  return "idle loop";
+}
+
+function extractActionTag(text) {
+  const value = toSafeText(text);
+  const match = value.match(/\[action:([^\]]+)\]/i);
+  return toSafeText(match?.[1] || "");
+}
+
 function applyCommandToWorld(sessionId, type, payload) {
   const world = ensureWorldState(sessionId);
   const actorId = toSafeText(payload?.actorId);
@@ -304,6 +328,9 @@ function applyCommandToWorld(sessionId, type, payload) {
       name: toSafeText(payload?.name, currentActor?.name || actorId),
       role: toSafeText(payload?.role, currentActor?.role || ""),
       position: normalizePosition(payload?.position),
+      movementSpeed: normalizeSpeed(payload?.speed, currentActor?.movementSpeed || 1),
+      currentAnimation: toSafeText(payload?.animation, currentActor?.currentAnimation || "idle loop"),
+      actionUntil: currentActor?.actionUntil || 0,
       lastUpdatedAt: now(),
       lastChat: currentActor?.lastChat || "",
     });
@@ -314,7 +341,10 @@ function applyCommandToWorld(sessionId, type, payload) {
     if (!currentActor) {
       return;
     }
+    const speed = normalizeSpeed(payload?.speed, currentActor.movementSpeed || 1);
     currentActor.position = normalizePosition(payload?.position);
+    currentActor.movementSpeed = speed;
+    currentActor.currentAnimation = inferLocomotionClip(speed);
     currentActor.lastUpdatedAt = now();
     world.actors.set(actorId, currentActor);
     return;
@@ -323,6 +353,13 @@ function applyCommandToWorld(sessionId, type, payload) {
   if (type === "say") {
     if (currentActor) {
       currentActor.lastChat = toSafeText(payload?.text);
+      const actionTag = extractActionTag(payload?.text);
+      if (actionTag) {
+        currentActor.currentAnimation = actionTag;
+        currentActor.actionUntil = now() + 2400;
+      } else if ((currentActor.actionUntil || 0) <= now()) {
+        currentActor.currentAnimation = inferLocomotionClip(currentActor.movementSpeed || 1);
+      }
       currentActor.lastUpdatedAt = now();
       world.actors.set(actorId, currentActor);
     }
@@ -334,6 +371,21 @@ function applyCommandToWorld(sessionId, type, payload) {
     if (world.chats.length > 50) {
       world.chats = world.chats.slice(-50);
     }
+    return;
+  }
+
+  if (type === "play_animation") {
+    if (!currentActor) {
+      return;
+    }
+    const clip = toSafeText(payload?.clip || payload?.name);
+    if (!clip) {
+      return;
+    }
+    currentActor.currentAnimation = clip;
+    currentActor.actionUntil = now() + Math.max(400, Number(payload?.durationMs) || 2200);
+    currentActor.lastUpdatedAt = now();
+    world.actors.set(actorId, currentActor);
   }
 }
 
@@ -564,13 +616,34 @@ app.get("/api/mcp/context", async (_, res) => {
         { type: "spawn", payload: { actorId: "string", modelName: "string", characterId: "string(optional)", name: "string(optional)", role: "string(optional)", position: "[x,y,z]" } },
         { type: "say", payload: { actorId: "string", text: "string", bubbleTtlMs: "number(optional)" } },
         { type: "move_to", payload: { actorId: "string", position: "[x,y,z]", speed: "number(optional)" } },
+        { type: "play_animation", payload: { actorId: "string", clip: "string", durationMs: "number(optional)" } },
       ],
       targetEndpoint: "POST /control (shared session default) or POST /control/:sessionId",
       autonomyLoop: [
         "Read /api/mcp/context.",
         "Ensure active character is spawned once with POST /api/scene/spawn (shared).",
-        "Then continuously send move_to/say to POST /control for the same actorId.",
+        "When moving, always send move_to with speed and matching locomotion animation intent.",
+        "When acting, send play_animation with clip names from the inspected model.",
+        "Then continuously send move_to/say/play_animation to POST /control for the same actorId.",
       ],
+      animationPolicy: {
+        requiredLocomotion: ["idle loop", "walk loop", "sprint loop"],
+        actionSet: [
+          "hit chest",
+          "hit knockback rm",
+          "fighting right jab",
+          "fighting left jab",
+          "defend",
+          "dizzy",
+          "jump start",
+          "jump land",
+          "jumping jacks",
+          "dance loop",
+          "backflip",
+          "meditate",
+        ],
+        instruction: "Prefer exact clip names from Model Capability Inspector. Use [action:<name>] tags in say text for traceability.",
+      },
     });
   } catch (error) {
     res.status(500).json({ error: "Failed to build MCP context", details: error.message });
@@ -579,6 +652,14 @@ app.get("/api/mcp/context", async (_, res) => {
 
 app.get("/api/world", requireSession, (req, res) => {
   const world = ensureWorldState(req.sessionId);
+  const currentTime = now();
+  for (const actor of world.actors.values()) {
+    if ((actor.actionUntil || 0) > 0 && actor.actionUntil <= currentTime) {
+      actor.actionUntil = 0;
+      actor.currentAnimation = inferLocomotionClip(actor.movementSpeed || 1);
+      actor.lastUpdatedAt = currentTime;
+    }
+  }
   res.json({
     sessionId: req.sessionId,
     actors: Array.from(world.actors.values()),
@@ -1453,7 +1534,7 @@ app.get("/ui/runtime", (_, res) => {
       </div>
       <p id="sessionInfo" class="muted">Session: connecting...</p>
       <p id="runtimeStatus" class="status"></p>
-      <p class="muted">Copilot/MCP should read <code>/api/mcp/context</code> and send <code>spawn</code>, <code>move_to</code>, <code>say</code> to <code>/control/:sessionId</code>.</p>
+      <p class="muted">Copilot/MCP should read <code>/api/mcp/context</code> and send <code>spawn</code>, <code>move_to</code>, <code>say</code>, <code>play_animation</code> to <code>/control</code>.</p>
     </section>
     <section class="card">
       <div id="sceneWrap">
@@ -1478,6 +1559,7 @@ app.get("/ui/runtime", (_, res) => {
     import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.166.1/build/three.module.js";
     import { OrbitControls } from "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/controls/OrbitControls.js";
     import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/loaders/GLTFLoader.js";
+    import { clone as cloneSkinned } from "https://cdn.jsdelivr.net/npm/three@0.166.1/examples/jsm/utils/SkeletonUtils.js";
     window.__runtimeModuleLoaded = true;
 
     const autoMoveBtn = document.getElementById("autoMove");
@@ -1541,6 +1623,7 @@ app.get("/ui/runtime", (_, res) => {
     const modelCache = new Map();
     const actorEntities = new Map();
     const pointer = new THREE.Vector3();
+    const clock = new THREE.Clock();
 
     const setStatus = (text, isError = false) => {
       runtimeStatus.textContent = text;
@@ -1608,14 +1691,48 @@ app.get("/ui/runtime", (_, res) => {
       return { line, points };
     };
 
+    const normalizeClipName = (value) => String(value || "").trim().toLowerCase();
+
+    const clipKeywords = {
+      "idle loop": ["idle"],
+      "walk loop": ["walk"],
+      "sprint loop": ["sprint", "run"],
+      "hit chest": ["hit chest", "hit_chest", "chest"],
+      "hit knockback rm": ["hit knockback rm", "knockback"],
+      "fighting right jab": ["right jab", "jab right"],
+      "fighting left jab": ["left jab", "jab left"],
+      defend: ["defend", "block", "guard"],
+      dizzy: ["dizzy", "stun"],
+      "jump start": ["jump start", "jump_start"],
+      "jump land": ["jump land", "jump_land", "land"],
+      "jumping jacks": ["jumping jacks", "jumping_jacks"],
+      "dance loop": ["dance loop", "dance"],
+      backflip: ["backflip", "back flip"],
+      meditate: ["meditate", "meditation"],
+    };
+
+    const findBestClip = (clips, requested) => {
+      if (!clips.length) return null;
+      const wanted = normalizeClipName(requested);
+      if (!wanted) return null;
+      const exact = clips.find((clip) => normalizeClipName(clip.name) === wanted);
+      if (exact) return exact;
+      const keys = clipKeywords[wanted] || [wanted];
+      const contains = clips.find((clip) => {
+        const n = normalizeClipName(clip.name);
+        return keys.some((k) => n.includes(k));
+      });
+      return contains || null;
+    };
+
     const loadModelObject = async (modelName) => {
       if (!modelName) {
-        return createFallbackBody();
+        return { scene: createFallbackBody(), animations: [] };
       }
       const url = "/assets/models/" + encodeURIComponent(modelName);
       const ext = modelName.split(".").pop()?.toLowerCase() || "";
       if (ext !== "glb" && ext !== "gltf") {
-        return createFallbackBody();
+        return { scene: createFallbackBody(), animations: [] };
       }
       if (!modelCache.has(modelName)) {
         modelCache.set(
@@ -1623,20 +1740,25 @@ app.get("/ui/runtime", (_, res) => {
           new Promise((resolve) => {
             loader.load(
               url,
-              (gltf) => resolve(gltf.scene || createFallbackBody()),
+              (gltf) => resolve({
+                scene: gltf.scene || createFallbackBody(),
+                animations: Array.isArray(gltf.animations) ? gltf.animations : [],
+              }),
               undefined,
-              () => resolve(createFallbackBody()),
+              () => resolve({ scene: createFallbackBody(), animations: [] }),
             );
           }),
         );
       }
       const src = await modelCache.get(modelName);
-      return src.clone(true);
+      const clonedScene = cloneSkinned(src.scene);
+      return { scene: clonedScene, animations: src.animations || [] };
     };
 
     const createActorEntity = async (actor) => {
       const root = new THREE.Group();
-      const model = await loadModelObject(actor.modelName);
+      const modelAsset = await loadModelObject(actor.modelName);
+      const model = modelAsset.scene;
       fitModelToHeight(model, 1.8);
       root.add(model);
 
@@ -1656,16 +1778,30 @@ app.get("/ui/runtime", (_, res) => {
       chat.style.display = "none";
       labelLayer.appendChild(chat);
 
+      const mixer = modelAsset.animations.length ? new THREE.AnimationMixer(model) : null;
+      const clipActions = new Map();
+      if (mixer) {
+        for (const clip of modelAsset.animations) {
+          clipActions.set(clip.name, mixer.clipAction(clip));
+        }
+      }
+
       root.position.copy(toVec3(actor.position));
       return {
         actorId: actor.actorId,
         root,
         model,
+        mixer,
+        clips: modelAsset.animations || [],
+        clipActions,
+        currentClipName: "",
         glow,
         trail,
         label,
         chat,
         targetPosition: toVec3(actor.position),
+        targetSpeed: Number(actor.movementSpeed || 1),
+        requestedAnimation: normalizeClipName(actor.currentAnimation || "idle loop"),
         lastChat: "",
         chatExpiresAt: 0,
       };
@@ -1679,6 +1815,35 @@ app.get("/ui/runtime", (_, res) => {
       entity.chat.textContent = text;
       entity.chat.style.display = "block";
       entity.chatExpiresAt = performance.now() + 3600;
+    };
+
+    const playEntityClip = (entity, requestedName) => {
+      if (!entity.mixer || !entity.clips.length) {
+        return;
+      }
+      const nextClip = findBestClip(entity.clips, requestedName) || findBestClip(entity.clips, "idle loop");
+      if (!nextClip) {
+        return;
+      }
+      if (entity.currentClipName === nextClip.name) {
+        return;
+      }
+      const nextAction = entity.clipActions.get(nextClip.name) || entity.mixer.clipAction(nextClip);
+      entity.clipActions.set(nextClip.name, nextAction);
+      nextAction.reset();
+      nextAction.enabled = true;
+      nextAction.setEffectiveTimeScale(1);
+      nextAction.setEffectiveWeight(1);
+      nextAction.fadeIn(0.2);
+      nextAction.play();
+
+      if (entity.currentClipName) {
+        const prevAction = entity.clipActions.get(entity.currentClipName);
+        if (prevAction) {
+          prevAction.fadeOut(0.2);
+        }
+      }
+      entity.currentClipName = nextClip.name;
     };
 
     const updateTrail = (entity) => {
@@ -1722,6 +1887,9 @@ app.get("/ui/runtime", (_, res) => {
           actorEntities.set(actor.actorId, entity);
         }
         entity.targetPosition.copy(toVec3(actor.position));
+        entity.targetSpeed = Number(actor.movementSpeed || 1);
+        entity.requestedAnimation = normalizeClipName(actor.currentAnimation || "idle loop");
+        playEntityClip(entity, entity.requestedAnimation);
         updateLabel(entity, actor);
         if (actor.lastChat && actor.lastChat !== entity.lastChat) {
           entity.lastChat = actor.lastChat;
@@ -1750,13 +1918,18 @@ app.get("/ui/runtime", (_, res) => {
     const animate = () => {
       requestAnimationFrame(animate);
       const t = performance.now() * 0.001;
+      const delta = Math.min(clock.getDelta(), 0.05);
       controls.update();
 
       for (const entity of actorEntities.values()) {
-        entity.root.position.lerp(entity.targetPosition, 0.1);
+        const follow = Math.min(0.24, Math.max(0.07, (entity.targetSpeed || 1) * 0.08));
+        entity.root.position.lerp(entity.targetPosition, follow);
         const dir = entity.targetPosition.clone().sub(entity.root.position);
         if (dir.lengthSq() > 0.001) {
           entity.root.rotation.y = Math.atan2(dir.x, dir.z);
+        }
+        if (entity.mixer) {
+          entity.mixer.update(delta);
         }
         entity.glow.material.opacity = 0.5 + Math.sin(t * 4.2) * 0.2;
         entity.glow.scale.setScalar(1 + Math.sin(t * 3.0) * 0.05);
@@ -1858,15 +2031,18 @@ app.get("/ui/runtime", (_, res) => {
       autoTimer = setInterval(async () => {
         const x = (Math.random() * 8) - 4;
         const z = (Math.random() * 8) - 4;
+        const speed = Math.random() > 0.5 ? 2.1 : 1.1;
+        const locomotion = speed >= 1.8 ? "sprint loop" : "walk loop";
         const lines = [
-          "Scanning the area.",
-          "I will guide you forward.",
-          "Hostiles are nearby.",
-          "Follow my position.",
-          "Switching route to objective.",
+          "[action:dance loop] Scanning the area.",
+          "[action:defend] I will guide you forward.",
+          "[action:fighting right jab] Hostiles are nearby.",
+          "[action:jumping jacks] Follow my position.",
+          "[action:meditate] Switching route to objective.",
         ];
         const text = lines[Math.floor(Math.random() * lines.length)];
-        await postControl({ type: "move_to", payload: { actorId, position: [x, 0, z], speed: 1.3 } });
+        await postControl({ type: "play_animation", payload: { actorId, clip: locomotion, durationMs: 1400 } });
+        await postControl({ type: "move_to", payload: { actorId, position: [x, 0, z], speed } });
         await postControl({ type: "say", payload: { actorId, text, bubbleTtlMs: 2600 } });
       }, 2200);
     });
@@ -2020,7 +2196,7 @@ app.post("/control/:sessionId", (req, res) => {
   Promise.resolve()
     .then(async () => {
       const nextPayload = { ...payload };
-      if (type === "move_to" || type === "say") {
+      if (type === "move_to" || type === "say" || type === "play_animation") {
         const resolvedActorId = await resolveActorIdFromPayload(sessionId, payload);
         if (resolvedActorId) {
           nextPayload.actorId = resolvedActorId;
@@ -2043,7 +2219,7 @@ app.post("/control", (req, res) => {
   Promise.resolve()
     .then(async () => {
       const nextPayload = { ...payload };
-      if (type === "move_to" || type === "say") {
+      if (type === "move_to" || type === "say" || type === "play_animation") {
         const resolvedActorId = await resolveActorIdFromPayload(sessionId, payload);
         if (resolvedActorId) {
           nextPayload.actorId = resolvedActorId;
