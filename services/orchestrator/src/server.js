@@ -31,11 +31,20 @@ const sessions = new Map();
 const commandQueues = new Map();
 /** @type {Map<string, Array<{commandId: number, executedAt: number, status: string, details?: string}>>} */
 const acknowledgements = new Map();
-/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], moveTarget?: [number, number, number] | null, movementSpeed?: number, locomotionMode?: string, currentAnimation?: string, actionUntil?: number, activeMoveId?: number, lastCompletedMoveId?: number, lastUpdatedAt: number, lastChat?: string}>, chats: Array<{actorId: string, text: string, at: number}>, arrivals: Array<{actorId: string, moveId: number, at: number, position: [number, number, number]}>, lastAdvanceAt: number}>} */
+/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], moveTarget?: [number, number, number] | null, movementSpeed?: number, locomotionMode?: string, currentAnimation?: string, actionUntil?: number, activeMoveId?: number, lastCompletedMoveId?: number, lastUpdatedAt: number, lastChat?: string, radius?: number, health?: number, respawnAt?: number}>, chats: Array<{actorId: string, text: string, at: number}>, arrivals: Array<{actorId: string, moveId: number, at: number, position: [number, number, number]}>, combatEvents: Array<Record<string, unknown>>, collisionCooldowns: Map<string, number>, lastAdvanceAt: number}>} */
 const worldStates = new Map();
 
 const newSessionId = () => crypto.randomUUID();
 const now = () => Date.now();
+const SPAWN_RANGE = 6;
+const SPAWN_MIN_GAP = 0.35;
+const ACTOR_RADIUS_DEFAULT = 0.55;
+const COLLISION_COOLDOWN_MS = 900;
+const COLLISION_DAMAGE = 8;
+const ATTACK_RANGE = 2.2;
+const ATTACK_DAMAGE_MIN = 10;
+const ATTACK_DAMAGE_MAX = 18;
+const MAX_COMBAT_EVENTS = 120;
 
 const sanitizeFilename = (name) =>
   name
@@ -223,7 +232,14 @@ function createSessionRecord(sessionId, deviceId) {
   });
   commandQueues.set(sessionId, []);
   acknowledgements.set(sessionId, []);
-  worldStates.set(sessionId, { actors: new Map(), chats: [], arrivals: [], lastAdvanceAt: now() });
+  worldStates.set(sessionId, {
+    actors: new Map(),
+    chats: [],
+    arrivals: [],
+    combatEvents: [],
+    collisionCooldowns: new Map(),
+    lastAdvanceAt: now(),
+  });
   return {
     sessionId,
     polling: {
@@ -271,6 +287,8 @@ function ensureWorldState(sessionId) {
       actors: new Map(),
       chats: [],
       arrivals: [],
+      combatEvents: [],
+      collisionCooldowns: new Map(),
       lastAdvanceAt: now(),
     });
   }
@@ -297,6 +315,57 @@ function normalizeSpeed(rawSpeed, fallback = 1) {
     return fallback;
   }
   return speed;
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+function pairKey(a, b) {
+  return [a, b].sort().join("::");
+}
+
+function addCombatEvent(world, event) {
+  world.combatEvents.push(event);
+  if (world.combatEvents.length > MAX_COMBAT_EVENTS) {
+    world.combatEvents = world.combatEvents.slice(-MAX_COMBAT_EVENTS);
+  }
+}
+
+function getActorRadius(actor) {
+  return Number(actor?.radius || ACTOR_RADIUS_DEFAULT);
+}
+
+function getRandomSpawnPosition(world, ignoreActorId = "") {
+  const hasOthers = Array.from(world.actors.values()).some((actor) => actor.actorId !== ignoreActorId);
+  if (!hasOthers) {
+    return [Number(randomBetween(-SPAWN_RANGE, SPAWN_RANGE).toFixed(2)), 0, Number(randomBetween(-SPAWN_RANGE, SPAWN_RANGE).toFixed(2))];
+  }
+
+  let bestCandidate = [0, 0, 0];
+  let bestClearance = -Infinity;
+  for (let i = 0; i < 40; i += 1) {
+    const candidate = [randomBetween(-SPAWN_RANGE, SPAWN_RANGE), 0, randomBetween(-SPAWN_RANGE, SPAWN_RANGE)];
+    let clearance = Infinity;
+    for (const actor of world.actors.values()) {
+      if (actor.actorId === ignoreActorId) {
+        continue;
+      }
+      const dx = candidate[0] - Number(actor.position?.[0] || 0);
+      const dz = candidate[2] - Number(actor.position?.[2] || 0);
+      const dist = Math.hypot(dx, dz);
+      const actorGap = dist - (getActorRadius(actor) + ACTOR_RADIUS_DEFAULT);
+      clearance = Math.min(clearance, actorGap);
+    }
+    if (clearance > bestClearance) {
+      bestClearance = clearance;
+      bestCandidate = [Number(candidate[0].toFixed(2)), 0, Number(candidate[2].toFixed(2))];
+    }
+    if (clearance >= SPAWN_MIN_GAP) {
+      return [Number(candidate[0].toFixed(2)), 0, Number(candidate[2].toFixed(2))];
+    }
+  }
+  return bestCandidate;
 }
 
 function makeRandomActorId(world, baseRaw) {
@@ -351,6 +420,22 @@ function advanceWorldState(sessionId, at = now()) {
   }
 
   for (const actor of world.actors.values()) {
+    if (Number(actor.respawnAt || 0) > 0 && Number(actor.respawnAt) <= at) {
+      actor.position = getRandomSpawnPosition(world, actor.actorId);
+      actor.health = 100;
+      actor.moveTarget = null;
+      actor.currentAnimation = "idle loop";
+      actor.actionUntil = 0;
+      actor.respawnAt = 0;
+      actor.lastUpdatedAt = at;
+      addCombatEvent(world, {
+        type: "respawn",
+        actorId: actor.actorId,
+        at,
+        position: actor.position,
+      });
+    }
+
     const target = Array.isArray(actor.moveTarget) ? actor.moveTarget : null;
     if (!target) {
       continue;
@@ -423,6 +508,77 @@ function advanceWorldState(sessionId, at = now()) {
     }
     actor.lastUpdatedAt = at;
   }
+
+  const actors = Array.from(world.actors.values());
+  for (let i = 0; i < actors.length; i += 1) {
+    for (let j = i + 1; j < actors.length; j += 1) {
+      const a = actors[i];
+      const b = actors[j];
+      const ax = Number(a.position?.[0] || 0);
+      const az = Number(a.position?.[2] || 0);
+      const bx = Number(b.position?.[0] || 0);
+      const bz = Number(b.position?.[2] || 0);
+      let dx = bx - ax;
+      let dz = bz - az;
+      let dist = Math.hypot(dx, dz);
+      const minDist = getActorRadius(a) + getActorRadius(b);
+      if (dist >= minDist) {
+        continue;
+      }
+
+      if (dist < 0.0001) {
+        const angle = randomBetween(0, Math.PI * 2);
+        dx = Math.cos(angle);
+        dz = Math.sin(angle);
+        dist = 1;
+      }
+
+      const nx = dx / dist;
+      const nz = dz / dist;
+      const penetration = minDist - dist;
+      const push = (penetration * 0.5) + 0.04;
+      a.position = [ax - nx * push, 0, az - nz * push];
+      b.position = [bx + nx * push, 0, bz + nz * push];
+      a.moveTarget = null;
+      b.moveTarget = null;
+      a.currentAnimation = "hit knockback rm";
+      b.currentAnimation = "hit knockback rm";
+      a.actionUntil = at + 900;
+      b.actionUntil = at + 900;
+      a.lastUpdatedAt = at;
+      b.lastUpdatedAt = at;
+
+      const key = pairKey(a.actorId, b.actorId);
+      const lastHitAt = Number(world.collisionCooldowns.get(key) || 0);
+      if (at - lastHitAt < COLLISION_COOLDOWN_MS) {
+        continue;
+      }
+      world.collisionCooldowns.set(key, at);
+
+      const damageA = COLLISION_DAMAGE;
+      const damageB = COLLISION_DAMAGE;
+      a.health = Math.max(0, Number(a.health || 100) - damageA);
+      b.health = Math.max(0, Number(b.health || 100) - damageB);
+      addCombatEvent(world, {
+        type: "collision_damage",
+        at,
+        actors: [a.actorId, b.actorId],
+        damage: { [a.actorId]: damageA, [b.actorId]: damageB },
+        health: { [a.actorId]: a.health, [b.actorId]: b.health },
+      });
+
+      if (a.health <= 0 && Number(a.respawnAt || 0) === 0) {
+        a.currentAnimation = "dizzy";
+        a.actionUntil = at + 1200;
+        a.respawnAt = at + 1300;
+      }
+      if (b.health <= 0 && Number(b.respawnAt || 0) === 0) {
+        b.currentAnimation = "dizzy";
+        b.actionUntil = at + 1200;
+        b.respawnAt = at + 1300;
+      }
+    }
+  }
 }
 
 function applyCommandToWorld(sessionId, type, payload) {
@@ -443,6 +599,7 @@ function applyCommandToWorld(sessionId, type, payload) {
     const nextCharacterId = toSafeText(payload?.characterId, currentActor?.characterId || "");
     const nextModelName = toSafeText(payload?.modelName, currentActor?.modelName || "");
     const nextName = toSafeText(payload?.name, currentActor?.name || actorId);
+    const spawnPosition = getRandomSpawnPosition(world, allowReuse ? actorId : "");
 
     world.actors.set(actorId, {
       actorId,
@@ -450,7 +607,7 @@ function applyCommandToWorld(sessionId, type, payload) {
       characterId: nextCharacterId,
       name: nextName,
       role: toSafeText(payload?.role, currentActor?.role || ""),
-      position: normalizePosition(payload?.position),
+      position: spawnPosition,
       moveTarget: null,
       movementSpeed: normalizeSpeed(payload?.speed, currentActor?.movementSpeed || 1),
       locomotionMode: toSafeText(payload?.locomotionMode, currentActor?.locomotionMode || "walk"),
@@ -460,10 +617,14 @@ function applyCommandToWorld(sessionId, type, payload) {
       lastCompletedMoveId: Number(currentActor?.lastCompletedMoveId || 0),
       lastUpdatedAt: now(),
       lastChat: currentActor?.lastChat || "",
+      radius: Number(currentActor?.radius || ACTOR_RADIUS_DEFAULT),
+      health: Number(currentActor?.health || 100),
+      respawnAt: Number(currentActor?.respawnAt || 0),
     });
     return {
       ...payload,
       actorId,
+      position: spawnPosition,
     };
   }
 
@@ -519,6 +680,63 @@ function applyCommandToWorld(sessionId, type, payload) {
     currentActor.actionUntil = now() + Math.max(400, Number(payload?.durationMs) || 2200);
     currentActor.lastUpdatedAt = now();
     world.actors.set(requestedActorId, currentActor);
+    return payload;
+  }
+
+  if (type === "attack") {
+    if (!currentActor) {
+      return payload;
+    }
+    let targetActor = null;
+    let nearestDist = Infinity;
+    for (const actor of world.actors.values()) {
+      if (actor.actorId === currentActor.actorId) {
+        continue;
+      }
+      const dx = Number(actor.position?.[0] || 0) - Number(currentActor.position?.[0] || 0);
+      const dz = Number(actor.position?.[2] || 0) - Number(currentActor.position?.[2] || 0);
+      const dist = Math.hypot(dx, dz);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        targetActor = actor;
+      }
+    }
+
+    const attackClip = toSafeText(payload?.clip, Math.random() < 0.5 ? "fighting right jab" : "fighting left jab");
+    currentActor.currentAnimation = attackClip;
+    currentActor.actionUntil = now() + 700;
+    currentActor.lastUpdatedAt = now();
+    world.actors.set(requestedActorId, currentActor);
+
+    if (!targetActor || nearestDist > ATTACK_RANGE) {
+      addCombatEvent(world, {
+        type: "attack_miss",
+        at: now(),
+        actorId: currentActor.actorId,
+      });
+      return payload;
+    }
+
+    const damage = Math.floor(randomBetween(ATTACK_DAMAGE_MIN, ATTACK_DAMAGE_MAX + 1));
+    targetActor.health = Math.max(0, Number(targetActor.health || 100) - damage);
+    targetActor.currentAnimation = "hit chest";
+    targetActor.actionUntil = now() + 900;
+    targetActor.moveTarget = null;
+    targetActor.lastUpdatedAt = now();
+    if (targetActor.health <= 0 && Number(targetActor.respawnAt || 0) === 0) {
+      targetActor.currentAnimation = "dizzy";
+      targetActor.actionUntil = now() + 1200;
+      targetActor.respawnAt = now() + 1300;
+    }
+    world.actors.set(targetActor.actorId, targetActor);
+    addCombatEvent(world, {
+      type: "attack_hit",
+      at: now(),
+      attacker: currentActor.actorId,
+      target: targetActor.actorId,
+      damage,
+      targetHealth: targetActor.health,
+    });
     return payload;
   }
 
@@ -749,19 +967,20 @@ app.get("/api/mcp/context", async (_, res) => {
       scene,
       rolePrompt,
       commandSchema: [
-        { type: "spawn", payload: { actorId: "string", modelName: "string", characterId: "string(optional)", name: "string(optional)", role: "string(optional)", position: "[x,y,z]" } },
+        { type: "spawn", payload: { modelName: "string", characterId: "string(optional)", name: "string(optional)", role: "string(optional)" } },
         { type: "say", payload: { actorId: "string", text: "string", bubbleTtlMs: "number(optional)" } },
         { type: "move_to", payload: { actorId: "string", position: "[x,y,z]" } },
         { type: "play_animation", payload: { actorId: "string", clip: "string", durationMs: "number(optional)" } },
+        { type: "attack", payload: { actorId: "string", clip: "string(optional)" } },
       ],
       targetEndpoint: "POST /control (shared session default) or POST /control/:sessionId",
       autonomyLoop: [
         "Read /api/mcp/context.",
-        "Spawn with preferred actorId per agent (for example dora-rock); backend auto-assigns unique ids like dora-rock-2 when needed.",
+        "Spawn without actorId/position; backend assigns random non-overlapping spawn and unique actorId.",
         "When moving, send move_to with destination only. Backend chooses walk/sprint and speed automatically.",
-        "When acting, send play_animation with clip names from the inspected model.",
-        "Poll /api/world and use arrivals callbacks to know when destination has been reached.",
-        "Then continuously send move_to/say/play_animation to POST /control for the same assigned actorId.",
+        "Use say to talk and attack to fight nearby actors.",
+        "Poll /api/world and use arrivals/combatEvents to react in real time.",
+        "Then continuously send move_to/say/attack/play_animation to POST /control for the same assigned actorId.",
       ],
       animationPolicy: {
         requiredLocomotion: ["idle loop", "walk loop", "sprint loop"],
@@ -780,6 +999,11 @@ app.get("/api/mcp/context", async (_, res) => {
           "meditate",
         ],
         instruction: "Backend chooses walk/sprint automatically on move_to (70/30). AI should not set speed for locomotion. Use [action:<name>] tags in say text for traceability.",
+      },
+      physicsPolicy: {
+        spawn: "Server randomizes spawn position and avoids overlap.",
+        collision: "Actors bounce on collision, take damage, and play hit reactions.",
+        combat: "Use attack command to damage nearest actor within range.",
       },
     });
   } catch (error) {
@@ -803,13 +1027,21 @@ app.get("/api/world", requireSession, (req, res) => {
     actors: Array.from(world.actors.values()),
     chats: world.chats,
     arrivals: world.arrivals,
+    combatEvents: world.combatEvents,
     updatedAt: now(),
   });
 });
 
 app.post("/api/world/reset", (req, res) => {
   const sessionId = ensureSharedSession();
-  worldStates.set(sessionId, { actors: new Map(), chats: [], arrivals: [], lastAdvanceAt: now() });
+  worldStates.set(sessionId, {
+    actors: new Map(),
+    chats: [],
+    arrivals: [],
+    combatEvents: [],
+    collisionCooldowns: new Map(),
+    lastAdvanceAt: now(),
+  });
   commandQueues.set(sessionId, []);
   acknowledgements.set(sessionId, []);
   const session = sessions.get(sessionId);
@@ -2388,7 +2620,7 @@ app.post("/control/:sessionId", (req, res) => {
   Promise.resolve()
     .then(async () => {
       const nextPayload = { ...payload };
-      if (type === "move_to" || type === "say" || type === "play_animation") {
+      if (type === "move_to" || type === "say" || type === "play_animation" || type === "attack") {
         const resolvedActorId = await resolveActorIdFromPayload(sessionId, payload);
         if (resolvedActorId) {
           nextPayload.actorId = resolvedActorId;
@@ -2411,7 +2643,7 @@ app.post("/control", (req, res) => {
   Promise.resolve()
     .then(async () => {
       const nextPayload = { ...payload };
-      if (type === "move_to" || type === "say" || type === "play_animation") {
+      if (type === "move_to" || type === "say" || type === "play_animation" || type === "attack") {
         const resolvedActorId = await resolveActorIdFromPayload(sessionId, payload);
         if (resolvedActorId) {
           nextPayload.actorId = resolvedActorId;

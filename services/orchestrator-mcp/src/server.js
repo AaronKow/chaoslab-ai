@@ -312,7 +312,7 @@ async function handleToolCall(name, args) {
     const type = requireString("type", args.type);
     const payload = isObject(args.payload) ? args.payload : {};
     const nextPayload = { ...payload };
-    if ((type === "move_to" || type === "say" || type === "play_animation") && !optionalString(nextPayload.actorId)) {
+    if ((type === "move_to" || type === "say" || type === "play_animation" || type === "attack") && !optionalString(nextPayload.actorId)) {
       throw new Error(`${type} requires payload.actorId. Use the actorId returned by spawn_avatar.`);
     }
     if (type === "move_to" && "speed" in nextPayload) {
