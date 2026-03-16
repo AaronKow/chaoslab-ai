@@ -1890,6 +1890,36 @@ app.get("/ui/runtime", (_, res) => {
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .healthHud {
+      position: absolute;
+      transform: translate(-50%, -140%);
+      display: none;
+      width: 110px;
+      pointer-events: none;
+    }
+    .healthTrack {
+      width: 100%;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(11, 22, 38, 0.84);
+      border: 1px solid rgba(175, 205, 240, 0.35);
+      overflow: hidden;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+    }
+    .healthFill {
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, #ff5f66, #ffcf5a 58%, #77ff9b);
+      transform-origin: left center;
+    }
+    .healthText {
+      margin-top: 3px;
+      text-align: center;
+      color: #dff1ff;
+      font-size: 10px;
+      letter-spacing: 0.02em;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+    }
     ul { margin: 8px 0 0; padding-left: 16px; }
     code { background: #1a2b45; border-radius: 6px; padding: 1px 5px; }
     .status { min-height: 18px; color: #9dd2ff; }
@@ -2154,6 +2184,20 @@ app.get("/ui/runtime", (_, res) => {
       chat.style.display = "none";
       labelLayer.appendChild(chat);
 
+      const healthHud = document.createElement("div");
+      healthHud.className = "healthHud";
+      const healthTrack = document.createElement("div");
+      healthTrack.className = "healthTrack";
+      const healthFill = document.createElement("div");
+      healthFill.className = "healthFill";
+      healthTrack.appendChild(healthFill);
+      const healthText = document.createElement("div");
+      healthText.className = "healthText";
+      healthText.textContent = "100 HP";
+      healthHud.appendChild(healthTrack);
+      healthHud.appendChild(healthText);
+      labelLayer.appendChild(healthHud);
+
       const mixer = modelAsset.animations.length ? new THREE.AnimationMixer(model) : null;
       const clipActions = new Map();
       if (mixer) {
@@ -2175,11 +2219,16 @@ app.get("/ui/runtime", (_, res) => {
         trail,
         label,
         chat,
+        healthHud,
+        healthFill,
+        healthText,
         targetPosition: toVec3(actor.position),
         targetSpeed: Number(actor.movementSpeed || 1),
         requestedAnimation: normalizeClipName(actor.currentAnimation || "idle loop"),
         lastChat: "",
         chatExpiresAt: 0,
+        lastHealth: Math.max(0, Math.min(100, Number(actor.health ?? 100))),
+        healthVisibleUntil: 0,
       };
     };
 
@@ -2189,6 +2238,7 @@ app.get("/ui/runtime", (_, res) => {
       scene.remove(entity.trail.line);
       entity.label.remove();
       entity.chat.remove();
+      entity.healthHud.remove();
       if (entity.mixer) {
         entity.mixer.stopAllAction();
       }
@@ -2222,6 +2272,16 @@ app.get("/ui/runtime", (_, res) => {
 
     const updateLabel = (entity, actor) => {
       entity.label.textContent = actor.name || actor.actorId;
+    };
+
+    const updateHealthHud = (entity, actor) => {
+      const currentHealth = Math.max(0, Math.min(100, Number(actor?.health ?? 100)));
+      if (currentHealth < entity.lastHealth) {
+        entity.healthVisibleUntil = performance.now() + 3000;
+      }
+      entity.lastHealth = currentHealth;
+      entity.healthFill.style.transform = "scaleX(" + (currentHealth / 100).toFixed(3) + ")";
+      entity.healthText.textContent = Math.round(currentHealth) + " HP";
     };
 
     const showChat = (entity, text) => {
@@ -2313,6 +2373,7 @@ app.get("/ui/runtime", (_, res) => {
         entity.requestedAnimation = normalizeClipName(actor.currentAnimation || "idle loop");
         playEntityClip(entity, entity.requestedAnimation);
         updateLabel(entity, actor);
+        updateHealthHud(entity, actor);
         if (actor.lastChat && actor.lastChat !== entity.lastChat) {
           entity.lastChat = actor.lastChat;
           showChat(entity, actor.lastChat);
@@ -2359,6 +2420,13 @@ app.get("/ui/runtime", (_, res) => {
           entity.label.style.display = "block";
           entity.label.style.left = p.x + "px";
           entity.label.style.top = p.y + "px";
+          if (entity.healthVisibleUntil && performance.now() <= entity.healthVisibleUntil) {
+            entity.healthHud.style.display = "block";
+            entity.healthHud.style.left = p.x + "px";
+            entity.healthHud.style.top = (p.y - 20) + "px";
+          } else {
+            entity.healthHud.style.display = "none";
+          }
           if (entity.chat.style.display !== "none") {
             entity.chat.style.left = p.x + "px";
             entity.chat.style.top = (p.y - 28) + "px";
@@ -2366,10 +2434,15 @@ app.get("/ui/runtime", (_, res) => {
         } else {
           entity.label.style.display = "none";
           entity.chat.style.display = "none";
+          entity.healthHud.style.display = "none";
         }
         if (entity.chatExpiresAt && performance.now() > entity.chatExpiresAt) {
           entity.chat.style.display = "none";
           entity.chatExpiresAt = 0;
+        }
+        if (entity.healthVisibleUntil && performance.now() > entity.healthVisibleUntil) {
+          entity.healthVisibleUntil = 0;
+          entity.healthHud.style.display = "none";
         }
       }
 

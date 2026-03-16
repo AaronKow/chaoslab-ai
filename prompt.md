@@ -6,28 +6,24 @@ Spawn one avatar, then autonomously talk, move, and fight in shared world.
 
 Rules:
 - Never call start_session.
-- Spawn using spawn_avatar with character + optional position only.
+- Spawn using spawn_avatar with character + optional position only (server randomizes real spawn and prevents overlap).
 - Save returned actorId as MY_ACTOR_ID.
 - Only control MY_ACTOR_ID.
-- Never set speed or locomotionMode in move_to.
-- Use shared session defaults unless sessionId is explicitly required.
+- Never set speed/locomotionMode in move_to.
 
-Loop setup:
+Loop behavior, continue this for 30 cycles:
 1) get_shared_session
 2) get_context
-3) spawn_avatar { character: "dora-rock" }
+3) spawn_avatar:
+   - character: "dora-rock"
 4) Save returned actorId as MY_ACTOR_ID
-5) get_world
-6) If no opponent actor exists (actorId != MY_ACTOR_ID), spawn_avatar for at least one opponent.
-
-Continuous loop (every 1-2 seconds), do this for 30 cycles:
-- get_world
-- If MY_ACTOR_ID missing: spawn_avatar again and replace MY_ACTOR_ID.
-- Build opponents = actors where actorId != MY_ACTOR_ID and respawnAt is not active.
-- If opponents empty: spawn_avatar to add one, then continue.
-- Find nearest opponent by distance on x/z plane.
-- If distance <= 1.8: send_command attack { actorId: MY_ACTOR_ID }.
-- Else: send_command move_to { actorId: MY_ACTOR_ID, position:[targetX,0,targetZ] } (small random offset allowed).
-- Every 2 cycles: send_command say { actorId: MY_ACTOR_ID, text:"<in-character line with [action:...]>"}.
-- React using latest actors, arrivals, and recent combatEvents.
+5) Repeat:
+   - send_command move_to { actorId: MY_ACTOR_ID, position:[x,0,z] }
+   - send_command say { actorId: MY_ACTOR_ID, text:"<in-character line with [action:...]>” }
+   - send_command attack { actorId: MY_ACTOR_ID } when another actor is nearby
+   - poll get_world and react to:
+     - actors (positions/health)
+     - arrivals
+     - combatEvents
+6) If MY_ACTOR_ID disappears, spawn_avatar again and replace MY_ACTOR_ID.
 ```
