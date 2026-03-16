@@ -31,7 +31,7 @@ const sessions = new Map();
 const commandQueues = new Map();
 /** @type {Map<string, Array<{commandId: number, executedAt: number, status: string, details?: string}>>} */
 const acknowledgements = new Map();
-/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], moveTarget?: [number, number, number] | null, movementSpeed?: number, locomotionMode?: string, currentAnimation?: string, actionUntil?: number, activeMoveId?: number, lastCompletedMoveId?: number, lastUpdatedAt: number, lastChat?: string, radius?: number, health?: number, respawnAt?: number}>, chats: Array<{actorId: string, text: string, at: number}>, arrivals: Array<{actorId: string, moveId: number, at: number, position: [number, number, number]}>, combatEvents: Array<Record<string, unknown>>, collisionCooldowns: Map<string, number>, lastAdvanceAt: number}>} */
+/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], moveTarget?: [number, number, number] | null, movementSpeed?: number, locomotionMode?: string, currentAnimation?: string, actionUntil?: number, activeMoveId?: number, lastCompletedMoveId?: number, lastUpdatedAt: number, lastChat?: string, radius?: number, health?: number}>, chats: Array<{actorId: string, text: string, at: number}>, arrivals: Array<{actorId: string, moveId: number, at: number, position: [number, number, number]}>, combatEvents: Array<Record<string, unknown>>, collisionCooldowns: Map<string, number>, lastAdvanceAt: number}>} */
 const worldStates = new Map();
 
 const newSessionId = () => crypto.randomUUID();
@@ -420,22 +420,6 @@ function advanceWorldState(sessionId, at = now()) {
   }
 
   for (const actor of world.actors.values()) {
-    if (Number(actor.respawnAt || 0) > 0 && Number(actor.respawnAt) <= at) {
-      actor.position = getRandomSpawnPosition(world, actor.actorId);
-      actor.health = 100;
-      actor.moveTarget = null;
-      actor.currentAnimation = "idle loop";
-      actor.actionUntil = 0;
-      actor.respawnAt = 0;
-      actor.lastUpdatedAt = at;
-      addCombatEvent(world, {
-        type: "respawn",
-        actorId: actor.actorId,
-        at,
-        position: actor.position,
-      });
-    }
-
     const target = Array.isArray(actor.moveTarget) ? actor.moveTarget : null;
     if (!target) {
       continue;
@@ -514,6 +498,9 @@ function advanceWorldState(sessionId, at = now()) {
     for (let j = i + 1; j < actors.length; j += 1) {
       const a = actors[i];
       const b = actors[j];
+      if (!world.actors.has(a.actorId) || !world.actors.has(b.actorId)) {
+        continue;
+      }
       const ax = Number(a.position?.[0] || 0);
       const az = Number(a.position?.[2] || 0);
       const bx = Number(b.position?.[0] || 0);
@@ -567,15 +554,25 @@ function advanceWorldState(sessionId, at = now()) {
         health: { [a.actorId]: a.health, [b.actorId]: b.health },
       });
 
-      if (a.health <= 0 && Number(a.respawnAt || 0) === 0) {
-        a.currentAnimation = "dizzy";
-        a.actionUntil = at + 1200;
-        a.respawnAt = at + 1300;
+      if (a.health <= 0) {
+        world.actors.delete(a.actorId);
+        addCombatEvent(world, {
+          type: "eliminated",
+          at,
+          actorId: a.actorId,
+          by: b.actorId,
+          cause: "collision",
+        });
       }
-      if (b.health <= 0 && Number(b.respawnAt || 0) === 0) {
-        b.currentAnimation = "dizzy";
-        b.actionUntil = at + 1200;
-        b.respawnAt = at + 1300;
+      if (b.health <= 0) {
+        world.actors.delete(b.actorId);
+        addCombatEvent(world, {
+          type: "eliminated",
+          at,
+          actorId: b.actorId,
+          by: a.actorId,
+          cause: "collision",
+        });
       }
     }
   }
@@ -619,7 +616,6 @@ function applyCommandToWorld(sessionId, type, payload) {
       lastChat: currentActor?.lastChat || "",
       radius: Number(currentActor?.radius || ACTOR_RADIUS_DEFAULT),
       health: Number(currentActor?.health || 100),
-      respawnAt: Number(currentActor?.respawnAt || 0),
     });
     return {
       ...payload,
@@ -723,12 +719,18 @@ function applyCommandToWorld(sessionId, type, payload) {
     targetActor.actionUntil = now() + 900;
     targetActor.moveTarget = null;
     targetActor.lastUpdatedAt = now();
-    if (targetActor.health <= 0 && Number(targetActor.respawnAt || 0) === 0) {
-      targetActor.currentAnimation = "dizzy";
-      targetActor.actionUntil = now() + 1200;
-      targetActor.respawnAt = now() + 1300;
+    if (targetActor.health <= 0) {
+      world.actors.delete(targetActor.actorId);
+      addCombatEvent(world, {
+        type: "eliminated",
+        at: now(),
+        actorId: targetActor.actorId,
+        by: currentActor.actorId,
+        cause: "attack",
+      });
+    } else {
+      world.actors.set(targetActor.actorId, targetActor);
     }
-    world.actors.set(targetActor.actorId, targetActor);
     addCombatEvent(world, {
       type: "attack_hit",
       at: now(),
