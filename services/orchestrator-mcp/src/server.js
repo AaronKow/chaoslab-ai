@@ -52,7 +52,7 @@ const toolSchemas = [
   },
   {
     name: "send_command",
-    description: "Send a control command. If sessionId is omitted, uses shared session.",
+    description: "Send a control command. If sessionId is omitted, uses shared session. Then repeatedly send_command with the same sessionId to control the same world.",
     inputSchema: {
       type: "object",
       required: ["type", "payload"],

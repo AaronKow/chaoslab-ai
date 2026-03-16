@@ -5,6 +5,7 @@ Goal:
 Spawn one avatar, then autonomously talk, move, and fight in shared world.
 
 Rules:
+- Never edit any files in this repo
 - Never call start_session.
 - Spawn using spawn_avatar with character + optional position only (server randomizes real spawn and prevents overlap).
 - Save returned actorId as MY_ACTOR_ID.
