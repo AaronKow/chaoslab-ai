@@ -977,10 +977,12 @@ app.get("/api/mcp/context", async (_, res) => {
       autonomyLoop: [
         "Read /api/mcp/context.",
         "Spawn without actorId/position; backend assigns random non-overlapping spawn and unique actorId.",
+        "Ensure there is at least one opponent in the same session (spawn_avatar if needed).",
+        "Poll /api/world every cycle, find nearest opponent, and choose action by distance.",
+        "If nearest opponent is within attack range, send attack; otherwise send move_to toward that opponent.",
         "When moving, send move_to with destination only. Backend chooses walk/sprint and speed automatically.",
-        "Use say to talk and attack to fight nearby actors.",
-        "Poll /api/world and use arrivals/combatEvents to react in real time.",
-        "Then continuously send move_to/say/attack/play_animation to POST /control for the same assigned actorId.",
+        "Use say periodically for in-character narration and use arrivals/combatEvents to react in real time.",
+        "Continue the loop with move_to/say/attack/play_animation for the same actorId.",
       ],
       animationPolicy: {
         requiredLocomotion: ["idle loop", "walk loop", "sprint loop"],

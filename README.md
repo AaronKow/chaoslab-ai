@@ -130,8 +130,14 @@ Use the chaoslab-orchestrator MCP tools.
 1) Get context.
 2) Start a session.
 3) Spawn active character.
-4) Enter a loop: send move_to and say commands in character.
-5) Check get_world after each cycle and adapt behavior.
+4) Ensure there is at least one opponent (spawn_avatar if needed).
+5) Enter a loop:
+   - get_world
+   - find nearest opponent
+   - if in range: attack
+   - else: move_to toward opponent
+   - every 2 cycles: say in character
+6) If actor disappears, spawn_active and continue.
 ```
 
 ## APIs (Core)

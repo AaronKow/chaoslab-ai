@@ -1,22 +1,33 @@
 ```
-Use the `chaoslab-orchestrator` MCP tools only.
+Use chaoslab-orchestrator MCP tools only.
 
 Goal:
-Attach to the CURRENT runtime preview session, then spawn and control the active character.
+Spawn one avatar, then autonomously talk, move, and fight in shared world.
 
-Steps:
-1) Call `get_context` first.
-2) Ask me for the current sessionId shown in Runtime Preview (`Session: ...`).
-3) Use that sessionId (do NOT create a new session unless I explicitly ask).
-4) Call `spawn_active` with that sessionId and position [0,0,0].
-5) Verify with `get_world` that the actor exists.
-6) Start an autonomous loop for 20 cycles:
-   - send `move_to` (vary [x,0,z] in range -4..4)
-   - every 2 cycles send `say` in-character using role/bio/voice style from `get_context`
-   - after each cycle call `get_world`; if actor missing, call `spawn_active` again.
-7) End with a summary:
-   - sessionId used
-   - actorId
-   - final position
-   - last 5 chat lines
+Rules:
+- Never call start_session.
+- Spawn using spawn_avatar with character + optional position only.
+- Save returned actorId as MY_ACTOR_ID.
+- Only control MY_ACTOR_ID.
+- Never set speed or locomotionMode in move_to.
+- Use shared session defaults unless sessionId is explicitly required.
+
+Loop setup:
+1) get_shared_session
+2) get_context
+3) spawn_avatar { character: "dora-rock" }
+4) Save returned actorId as MY_ACTOR_ID
+5) get_world
+6) If no opponent actor exists (actorId != MY_ACTOR_ID), spawn_avatar for at least one opponent.
+
+Continuous loop (every 1-2 seconds), do this for 30 cycles:
+- get_world
+- If MY_ACTOR_ID missing: spawn_avatar again and replace MY_ACTOR_ID.
+- Build opponents = actors where actorId != MY_ACTOR_ID and respawnAt is not active.
+- If opponents empty: spawn_avatar to add one, then continue.
+- Find nearest opponent by distance on x/z plane.
+- If distance <= 1.8: send_command attack { actorId: MY_ACTOR_ID }.
+- Else: send_command move_to { actorId: MY_ACTOR_ID, position:[targetX,0,targetZ] } (small random offset allowed).
+- Every 2 cycles: send_command say { actorId: MY_ACTOR_ID, text:"<in-character line with [action:...]>"}.
+- React using latest actors, arrivals, and recent combatEvents.
 ```
