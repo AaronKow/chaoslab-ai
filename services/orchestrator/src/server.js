@@ -31,7 +31,7 @@ const sessions = new Map();
 const commandQueues = new Map();
 /** @type {Map<string, Array<{commandId: number, executedAt: number, status: string, details?: string}>>} */
 const acknowledgements = new Map();
-/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], moveTarget?: [number, number, number] | null, movementSpeed?: number, locomotionMode?: string, currentAnimation?: string, actionUntil?: number, activeMoveId?: number, lastCompletedMoveId?: number, lastUpdatedAt: number, lastChat?: string, radius?: number, health?: number}>, chats: Array<{actorId: string, text: string, at: number}>, arrivals: Array<{actorId: string, moveId: number, at: number, position: [number, number, number]}>, combatEvents: Array<Record<string, unknown>>, collisionCooldowns: Map<string, number>, lastAdvanceAt: number}>} */
+/** @type {Map<string, {actors: Map<string, {actorId: string, modelName: string, characterId?: string, name?: string, role?: string, position: [number, number, number], moveTarget?: [number, number, number] | null, movementSpeed?: number, locomotionMode?: string, currentAnimation?: string, actionUntil?: number, activeMoveId?: number, lastCompletedMoveId?: number, lastUpdatedAt: number, lastChat?: string, radius?: number, health?: number, facingYaw?: number}>, chats: Array<{actorId: string, text: string, at: number}>, arrivals: Array<{actorId: string, moveId: number, at: number, position: [number, number, number]}>, combatEvents: Array<Record<string, unknown>>, collisionCooldowns: Map<string, number>, lastAdvanceAt: number}>} */
 const worldStates = new Map();
 
 const newSessionId = () => crypto.randomUUID();
@@ -44,6 +44,9 @@ const COLLISION_DAMAGE = 8;
 const ATTACK_RANGE = 2.2;
 const ATTACK_DAMAGE_MIN = 10;
 const ATTACK_DAMAGE_MAX = 18;
+const ATTACK_FACING_DOT = 0.64;
+const ATTACK_TURN_RATE_RAD = 1.2;
+const MOVE_TURN_RATE_RAD_PER_SEC = 5.5;
 const MAX_COMBAT_EVENTS = 120;
 
 const sanitizeFilename = (name) =>
@@ -325,6 +328,40 @@ function pairKey(a, b) {
   return [a, b].sort().join("::");
 }
 
+function normalizeAngle(angle) {
+  let next = Number(angle);
+  if (!Number.isFinite(next)) {
+    return 0;
+  }
+  while (next > Math.PI) next -= Math.PI * 2;
+  while (next < -Math.PI) next += Math.PI * 2;
+  return next;
+}
+
+function shortestAngleDelta(from, to) {
+  return normalizeAngle(to - from);
+}
+
+function turnToward(current, target, maxStep) {
+  const safeCurrent = normalizeAngle(current);
+  const safeTarget = normalizeAngle(target);
+  const safeStep = Math.max(0, Number(maxStep) || 0);
+  const delta = shortestAngleDelta(safeCurrent, safeTarget);
+  if (Math.abs(delta) <= safeStep) {
+    return safeTarget;
+  }
+  return normalizeAngle(safeCurrent + Math.sign(delta) * safeStep);
+}
+
+function yawToTarget(fromPos, toPos) {
+  const dx = Number(toPos?.[0] || 0) - Number(fromPos?.[0] || 0);
+  const dz = Number(toPos?.[2] || 0) - Number(fromPos?.[2] || 0);
+  if (Math.abs(dx) < 0.0001 && Math.abs(dz) < 0.0001) {
+    return 0;
+  }
+  return Math.atan2(dx, dz);
+}
+
 function addCombatEvent(world, event) {
   world.combatEvents.push(event);
   if (world.combatEvents.length > MAX_COMBAT_EVENTS) {
@@ -395,14 +432,6 @@ function extractActionTag(text) {
 }
 
 function chooseBackendLocomotion() {
-  const sprint = Math.random() < 0.3;
-  if (sprint) {
-    return {
-      mode: "sprint",
-      speed: Number((2.0 + Math.random() * 0.6).toFixed(2)),
-      clip: "sprint loop",
-    };
-  }
   return {
     mode: "walk",
     speed: Number((1.0 + Math.random() * 0.4).toFixed(2)),
@@ -425,15 +454,18 @@ function advanceWorldState(sessionId, at = now()) {
       continue;
     }
     const cx = Number(actor.position?.[0] || 0);
-    const cy = Number(actor.position?.[1] || 0);
+    const cy = 0;
     const cz = Number(actor.position?.[2] || 0);
     const tx = Number(target[0] || 0);
-    const ty = Number(target[1] || 0);
+    const ty = 0;
     const tz = Number(target[2] || 0);
     const dx = tx - cx;
     const dy = ty - cy;
     const dz = tz - cz;
     const distance = Math.hypot(dx, dy, dz);
+    const desiredYaw = Math.atan2(dx, dz);
+    const maxTurn = MOVE_TURN_RATE_RAD_PER_SEC * (deltaMs / 1000);
+    actor.facingYaw = turnToward(Number(actor.facingYaw || 0), desiredYaw, maxTurn);
 
     if (distance <= 0.001) {
       actor.position = [tx, ty, tz];
@@ -528,10 +560,12 @@ function advanceWorldState(sessionId, at = now()) {
       b.position = [bx + nx * push, 0, bz + nz * push];
       a.moveTarget = null;
       b.moveTarget = null;
-      a.currentAnimation = "hit chest";
-      b.currentAnimation = "hit chest";
-      a.actionUntil = at + 900;
-      b.actionUntil = at + 900;
+      if ((a.actionUntil || 0) <= at) {
+        a.currentAnimation = "idle loop";
+      }
+      if ((b.actionUntil || 0) <= at) {
+        b.currentAnimation = "idle loop";
+      }
       a.lastUpdatedAt = at;
       b.lastUpdatedAt = at;
 
@@ -541,6 +575,10 @@ function advanceWorldState(sessionId, at = now()) {
         continue;
       }
       world.collisionCooldowns.set(key, at);
+      a.currentAnimation = "hit chest";
+      b.currentAnimation = "hit chest";
+      a.actionUntil = at + 900;
+      b.actionUntil = at + 900;
 
       const damageA = COLLISION_DAMAGE;
       const damageB = COLLISION_DAMAGE;
@@ -552,6 +590,10 @@ function advanceWorldState(sessionId, at = now()) {
         actors: [a.actorId, b.actorId],
         damage: { [a.actorId]: damageA, [b.actorId]: damageB },
         health: { [a.actorId]: a.health, [b.actorId]: b.health },
+        positions: {
+          [a.actorId]: a.position,
+          [b.actorId]: b.position,
+        },
       });
 
       if (a.health <= 0) {
@@ -616,6 +658,7 @@ function applyCommandToWorld(sessionId, type, payload) {
       lastChat: currentActor?.lastChat || "",
       radius: Number(currentActor?.radius || ACTOR_RADIUS_DEFAULT),
       health: Number(currentActor?.health || 100),
+      facingYaw: Number(currentActor?.facingYaw || randomBetween(-Math.PI, Math.PI)),
     });
     return {
       ...payload,
@@ -698,17 +741,42 @@ function applyCommandToWorld(sessionId, type, payload) {
       }
     }
 
+    const eventAt = now();
     const attackClip = toSafeText(payload?.clip, Math.random() < 0.5 ? "fighting right jab" : "fighting left jab");
+    if (targetActor) {
+      const targetYaw = yawToTarget(currentActor.position, targetActor.position);
+      currentActor.facingYaw = turnToward(
+        Number(currentActor.facingYaw || 0),
+        targetYaw,
+        ATTACK_TURN_RATE_RAD,
+      );
+    }
     currentActor.currentAnimation = attackClip;
-    currentActor.actionUntil = now() + 700;
-    currentActor.lastUpdatedAt = now();
+    currentActor.actionUntil = eventAt + 700;
+    currentActor.lastUpdatedAt = eventAt;
     world.actors.set(requestedActorId, currentActor);
 
     if (!targetActor || nearestDist > ATTACK_RANGE) {
       addCombatEvent(world, {
         type: "attack_miss",
-        at: now(),
+        at: eventAt,
         actorId: currentActor.actorId,
+        reason: !targetActor ? "no_target" : "out_of_range",
+      });
+      return payload;
+    }
+
+    const desiredYaw = yawToTarget(currentActor.position, targetActor.position);
+    const yawDiff = Math.abs(shortestAngleDelta(Number(currentActor.facingYaw || 0), desiredYaw));
+    const facingDot = Math.cos(yawDiff);
+    if (facingDot < ATTACK_FACING_DOT) {
+      addCombatEvent(world, {
+        type: "attack_miss",
+        at: eventAt,
+        actorId: currentActor.actorId,
+        target: targetActor.actorId,
+        reason: "not_facing",
+        yawDiffDeg: Number((yawDiff * 180 / Math.PI).toFixed(1)),
       });
       return payload;
     }
@@ -716,14 +784,14 @@ function applyCommandToWorld(sessionId, type, payload) {
     const damage = Math.floor(randomBetween(ATTACK_DAMAGE_MIN, ATTACK_DAMAGE_MAX + 1));
     targetActor.health = Math.max(0, Number(targetActor.health || 100) - damage);
     targetActor.currentAnimation = "hit chest";
-    targetActor.actionUntil = now() + 900;
+    targetActor.actionUntil = eventAt + 900;
     targetActor.moveTarget = null;
-    targetActor.lastUpdatedAt = now();
+    targetActor.lastUpdatedAt = eventAt;
     if (targetActor.health <= 0) {
       world.actors.delete(targetActor.actorId);
       addCombatEvent(world, {
         type: "eliminated",
-        at: now(),
+        at: eventAt,
         actorId: targetActor.actorId,
         by: currentActor.actorId,
         cause: "attack",
@@ -733,11 +801,12 @@ function applyCommandToWorld(sessionId, type, payload) {
     }
     addCombatEvent(world, {
       type: "attack_hit",
-      at: now(),
+      at: eventAt,
       attacker: currentActor.actorId,
       target: targetActor.actorId,
       damage,
       targetHealth: targetActor.health,
+      targetPosition: targetActor.position,
     });
     return payload;
   }
@@ -1006,8 +1075,9 @@ app.get("/api/mcp/context", async (_, res) => {
       },
       physicsPolicy: {
         spawn: "Server randomizes spawn position and avoids overlap.",
+        movement: "Actors move continuously over time toward move_to targets. No teleport jumps are allowed.",
         collision: "Actors bounce on collision, take damage, and play hit reactions.",
-        combat: "Use attack command to damage nearest actor within range.",
+        combat: "Attack only lands when target is in range and inside the actor's forward punch arc.",
       },
     });
   } catch (error) {
@@ -1022,7 +1092,7 @@ app.get("/api/world", requireSession, (req, res) => {
   for (const actor of world.actors.values()) {
     if ((actor.actionUntil || 0) > 0 && actor.actionUntil <= currentTime) {
       actor.actionUntil = 0;
-      actor.currentAnimation = inferLocomotionClip(actor.movementSpeed || 1);
+      actor.currentAnimation = Array.isArray(actor.moveTarget) ? inferLocomotionClip(actor.movementSpeed || 1) : "idle loop";
       actor.lastUpdatedAt = currentTime;
     }
   }
@@ -1880,17 +1950,18 @@ app.get("/ui/runtime", (_, res) => {
     }
     .chatBubble {
       position: absolute;
-      transform: translate(-50%, -130%);
+      transform: translate(-50%, -100%);
       background: rgba(255, 254, 228, 0.95);
       color: #12243c;
       border-radius: 8px;
       padding: 4px 8px;
       font-size: 12px;
       border: 1px solid rgba(18, 36, 60, 0.28);
-      max-width: 260px;
-      white-space: nowrap;
+      max-width: 250px;
+      white-space: normal;
       overflow: hidden;
       text-overflow: ellipsis;
+      overflow-wrap: break-word;
     }
     .healthHud {
       position: absolute;
@@ -1921,6 +1992,17 @@ app.get("/ui/runtime", (_, res) => {
       font-size: 10px;
       letter-spacing: 0.02em;
       text-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
+    }
+    .damagePopup {
+      position: absolute;
+      transform: translate(-50%, -100%);
+      color: #ffd56c;
+      font-weight: 800;
+      font-size: 16px;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.95);
+      white-space: nowrap;
+      will-change: transform, opacity;
+      pointer-events: none;
     }
     ul { margin: 8px 0 0; padding-left: 16px; }
     code { background: #1a2b45; border-radius: 6px; padding: 1px 5px; }
@@ -1983,6 +2065,9 @@ app.get("/ui/runtime", (_, res) => {
     let autoTimer = null;
     let activeContext = null;
     let activeCharacterRef = null;
+    let combatEventCursor = 0;
+    const damagePopups = [];
+    const impactBursts = [];
 
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -2043,6 +2128,21 @@ app.get("/ui/runtime", (_, res) => {
       const y = Number(pos?.[1] || 0);
       const z = Number(pos?.[2] || 0);
       return new THREE.Vector3(x, y, z);
+    };
+
+    const normalizeAngle = (angle) => {
+      let next = Number(angle) || 0;
+      while (next > Math.PI) next -= Math.PI * 2;
+      while (next < -Math.PI) next += Math.PI * 2;
+      return next;
+    };
+
+    const shortestAngleDelta = (from, to) => normalizeAngle(to - from);
+
+    const turnToward = (current, target, maxStep) => {
+      const delta = shortestAngleDelta(current, target);
+      if (Math.abs(delta) <= maxStep) return normalizeAngle(target);
+      return normalizeAngle(current + Math.sign(delta) * maxStep);
     };
 
     const fitModelToHeight = (object3d, targetHeight) => {
@@ -2209,6 +2309,7 @@ app.get("/ui/runtime", (_, res) => {
       }
 
       root.position.copy(toVec3(actor.position));
+      root.rotation.y = Number(actor.facingYaw || 0);
       return {
         actorId: actor.actorId,
         root,
@@ -2225,6 +2326,7 @@ app.get("/ui/runtime", (_, res) => {
         healthFill,
         healthText,
         targetPosition: toVec3(actor.position),
+        targetYaw: Number(actor.facingYaw || 0),
         targetSpeed: Number(actor.movementSpeed || 1),
         requestedAnimation: normalizeClipName(actor.currentAnimation || "idle loop"),
         lastChat: "",
@@ -2337,6 +2439,84 @@ app.get("/ui/runtime", (_, res) => {
       };
     };
 
+    const getActorWorldPosition = (actorId, fallbackPosition) => {
+      if (actorId && actorEntities.has(actorId)) {
+        return actorEntities.get(actorId).root.position.clone();
+      }
+      const actors = Array.isArray(worldState.actors) ? worldState.actors : [];
+      const actor = actors.find((item) => item?.actorId === actorId);
+      if (actor?.position) {
+        return toVec3(actor.position);
+      }
+      if (Array.isArray(fallbackPosition)) {
+        return toVec3(fallbackPosition);
+      }
+      return null;
+    };
+
+    const spawnImpactBurst = (worldPos) => {
+      if (!worldPos) return;
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.2, 10, 10),
+        new THREE.MeshBasicMaterial({
+          color: 0xffc14d,
+          transparent: true,
+          opacity: 0.95,
+        }),
+      );
+      mesh.position.copy(worldPos.clone().add(new THREE.Vector3(0, 1.0, 0)));
+      scene.add(mesh);
+      impactBursts.push({
+        mesh,
+        createdAt: performance.now(),
+        expiresAt: performance.now() + 360,
+      });
+    };
+
+    const spawnDamagePopup = (worldPos, damage) => {
+      if (!worldPos || !Number.isFinite(Number(damage))) return;
+      const el = document.createElement("div");
+      el.className = "damagePopup";
+      el.textContent = "-" + Math.max(0, Math.round(Number(damage)));
+      labelLayer.appendChild(el);
+      damagePopups.push({
+        el,
+        worldPos: worldPos.clone().add(new THREE.Vector3((Math.random() - 0.5) * 0.3, 1.9, (Math.random() - 0.5) * 0.3)),
+        createdAt: performance.now(),
+        expiresAt: performance.now() + 850,
+      });
+    };
+
+    const processCombatEvent = (event) => {
+      if (!event || typeof event !== "object") return;
+      if (event.type === "attack_hit") {
+        const targetPos = getActorWorldPosition(event.target, event.targetPosition);
+        spawnDamagePopup(targetPos, event.damage);
+        spawnImpactBurst(targetPos);
+        return;
+      }
+      if (event.type === "collision_damage") {
+        const actorIds = Array.isArray(event.actors) ? event.actors : [];
+        for (const actorId of actorIds) {
+          const amount = Number(event.damage?.[actorId]);
+          const pos = getActorWorldPosition(actorId, event.positions?.[actorId]);
+          spawnDamagePopup(pos, amount);
+          spawnImpactBurst(pos);
+        }
+      }
+    };
+
+    const processCombatEvents = () => {
+      const events = Array.isArray(worldState.combatEvents) ? worldState.combatEvents : [];
+      if (events.length < combatEventCursor) {
+        combatEventCursor = 0;
+      }
+      for (let i = combatEventCursor; i < events.length; i += 1) {
+        processCombatEvent(events[i]);
+      }
+      combatEventCursor = events.length;
+    };
+
     const renderChats = () => {
       chatList.innerHTML = "";
       const latest = (worldState.chats || []).slice(-8).reverse();
@@ -2371,6 +2551,8 @@ app.get("/ui/runtime", (_, res) => {
         nextIds.add(actor.actorId);
         const entity = await getOrCreateActorEntity(actor);
         entity.targetPosition.copy(toVec3(actor.position));
+        entity.targetPosition.y = 0;
+        entity.targetYaw = Number.isFinite(Number(actor.facingYaw)) ? Number(actor.facingYaw) : entity.targetYaw;
         entity.targetSpeed = Number(actor.movementSpeed || 1);
         entity.requestedAnimation = normalizeClipName(actor.currentAnimation || "idle loop");
         playEntityClip(entity, entity.requestedAnimation);
@@ -2386,6 +2568,7 @@ app.get("/ui/runtime", (_, res) => {
         removeActorEntity(entity);
         actorEntities.delete(actorId);
       }
+      processCombatEvents();
       renderChats();
     };
 
@@ -2404,11 +2587,32 @@ app.get("/ui/runtime", (_, res) => {
       controls.update();
 
       for (const entity of actorEntities.values()) {
-        const follow = Math.min(0.2, Math.max(0.05, (entity.targetSpeed || 1) * 0.06));
-        entity.root.position.lerp(entity.targetPosition, follow);
-        const dir = entity.targetPosition.clone().sub(entity.root.position);
-        if (dir.lengthSq() > 0.001) {
-          entity.root.rotation.y = Math.atan2(dir.x, dir.z);
+        const toTarget = entity.targetPosition.clone().sub(entity.root.position);
+        toTarget.y = 0;
+        const dist = toTarget.length();
+        const speed = Math.max(0.2, Number(entity.targetSpeed || 1));
+        const maxStep = speed * delta;
+        entity.root.position.y = 0;
+        if (dist > 0.0001) {
+          if (maxStep >= dist) {
+            entity.root.position.copy(entity.targetPosition);
+            entity.root.position.y = 0;
+          } else {
+            entity.root.position.addScaledVector(toTarget.normalize(), maxStep);
+            entity.root.position.y = 0;
+          }
+          const moveYaw = Math.atan2(toTarget.x, toTarget.z);
+          entity.root.rotation.y = turnToward(
+            Number(entity.root.rotation.y || 0),
+            moveYaw,
+            5.2 * delta,
+          );
+        } else if (Number.isFinite(Number(entity.targetYaw))) {
+          entity.root.rotation.y = turnToward(
+            Number(entity.root.rotation.y || 0),
+            Number(entity.targetYaw || 0),
+            6.4 * delta,
+          );
         }
         if (entity.mixer) {
           entity.mixer.update(delta);
@@ -2431,7 +2635,7 @@ app.get("/ui/runtime", (_, res) => {
           }
           if (entity.chat.style.display !== "none") {
             entity.chat.style.left = p.x + "px";
-            entity.chat.style.top = (p.y - 28) + "px";
+            entity.chat.style.top = (p.y - 64) + "px";
           }
         } else {
           entity.label.style.display = "none";
@@ -2445,6 +2649,40 @@ app.get("/ui/runtime", (_, res) => {
         if (entity.healthVisibleUntil && performance.now() > entity.healthVisibleUntil) {
           entity.healthVisibleUntil = 0;
           entity.healthHud.style.display = "none";
+        }
+      }
+
+      for (let i = impactBursts.length - 1; i >= 0; i -= 1) {
+        const burst = impactBursts[i];
+        const life = Math.max(0, burst.expiresAt - performance.now());
+        const tNorm = 1 - (life / Math.max(1, burst.expiresAt - burst.createdAt));
+        burst.mesh.scale.setScalar(1 + tNorm * 2.3);
+        burst.mesh.material.opacity = Math.max(0, 0.95 * (1 - tNorm));
+        if (life <= 0) {
+          scene.remove(burst.mesh);
+          burst.mesh.geometry.dispose();
+          burst.mesh.material.dispose();
+          impactBursts.splice(i, 1);
+        }
+      }
+
+      for (let i = damagePopups.length - 1; i >= 0; i -= 1) {
+        const popup = damagePopups[i];
+        const life = Math.max(0, popup.expiresAt - performance.now());
+        const tNorm = 1 - (life / Math.max(1, popup.expiresAt - popup.createdAt));
+        popup.worldPos.y += delta * 0.7;
+        const p = projectToScreen(popup.worldPos);
+        if (p.visible) {
+          popup.el.style.display = "block";
+          popup.el.style.left = p.x + "px";
+          popup.el.style.top = p.y + "px";
+          popup.el.style.opacity = String(Math.max(0, 1 - tNorm));
+        } else {
+          popup.el.style.display = "none";
+        }
+        if (life <= 0) {
+          popup.el.remove();
+          damagePopups.splice(i, 1);
         }
       }
 
