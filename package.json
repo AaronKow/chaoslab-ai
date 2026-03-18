@@ -12,5 +12,8 @@
     "dev:agent": "npm --workspace services/mcp-agent run dev",
     "dev:openai-agent": "npm --workspace services/openai-agent run dev",
     "dev:mcp": "npm --workspace services/orchestrator-mcp run dev"
+  },
+  "dependencies": {
+    "openai": "^4.104.0"
   }
 }

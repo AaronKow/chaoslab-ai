@@ -1,6 +1,22 @@
+import { createRequire } from "module";
+import { fileURLToPath } from "url";
+import { dirname, resolve } from "path";
+
+// Load .env from the service directory, overriding any shell env vars
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const require = createRequire(import.meta.url);
+const dotenv = require("dotenv");
+dotenv.config({ path: resolve(__dirname, "../.env"), override: true });
+
+function normalizeSecret(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().replace(/^"|"$/g, "").replace(/^'|'$/g, "");
+}
+
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || "http://localhost:8787";
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const OPENAI_API_KEY = normalizeSecret(process.env.OPENAI_API_KEY || process.env.OPEN_AI_KEY || "");
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5-nano";
 const DEVICE_ID = process.env.DEVICE_ID || "openai-agent";
 const CHARACTER_ID = process.env.CHARACTER_ID || "";
 const SESSION_ID = process.env.SESSION_ID || "";
@@ -334,8 +350,7 @@ async function askModelForAction(worldSummary) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       input,
-      temperature: 0.3,
-      max_output_tokens: 140,
+      max_output_tokens: 512,
     }),
   });
 
@@ -347,7 +362,7 @@ async function askModelForAction(worldSummary) {
   }
 
   if (!response.ok) {
-    throw new Error(`OpenAI request failed: ${response.status} ${JSON.stringify(body)}`);
+    throw new Error(`OpenAI API error: ${response.status} ${body?.error?.message || JSON.stringify(body)}`);
   }
 
   const text = extractResponseText(body);
