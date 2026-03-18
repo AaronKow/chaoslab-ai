@@ -32,7 +32,7 @@ No extra command needed — already running from Terminal 1.
 ### Terminal 3: Autonomous Agent (Optional)
 
 ```bash
-pnpm run dev:agent
+  pnpm run dev:agent
 ```
 
 Or with custom settings:
@@ -43,6 +43,16 @@ CHAT_EVERY_N_TICKS=4 \
 TICK_MS=2500 \
 AUTO_SPAWN=true \
   pnpm run dev:agent
+```
+
+### Terminal 3 (Alternative): OpenAI Autonomous Agent
+
+```bash
+OPENAI_API_KEY=sk-... \
+OPENAI_MODEL=gpt-5-nano \
+TICK_MS=1800 \
+AUTO_SPAWN=true \
+  pnpm run dev:openai-agent
 ```
 
 ---
@@ -213,6 +223,8 @@ chaoslab-ai/
 │   │   └── src/server.js         ← MCP tool handlers
 │   └── mcp-agent/                ← Autonomous agent
 │       └── src/agent.js          ← Polling loop
+│   └── openai-agent/             ← OpenAI-powered autonomous agent
+│       └── src/agent.js          ← Model decision loop + command guardrails
 ├── apps/
 │   └── mobile-expo/              ← iOS/Android app
 │       ├── App.tsx               ← Three.js 3D + React Native UI

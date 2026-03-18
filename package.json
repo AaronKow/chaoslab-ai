@@ -10,6 +10,7 @@
     "dev:server": "npm --workspace services/orchestrator run dev",
     "dev:mobile": "npm --workspace apps/mobile-expo run start",
     "dev:agent": "npm --workspace services/mcp-agent run dev",
+    "dev:openai-agent": "npm --workspace services/openai-agent run dev",
     "dev:mcp": "npm --workspace services/orchestrator-mcp run dev"
   }
 }

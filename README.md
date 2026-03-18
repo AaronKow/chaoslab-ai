@@ -9,6 +9,7 @@ A multiplayer 3D world server with AI-driven characters, combat simulation, and 
 | **Orchestrator** | `services/orchestrator` | Central HTTP server (8787) — sessions, world state, 3D models, commands, web UI |
 | **Orchestrator MCP** | `services/orchestrator-mcp` | stdio MCP bridge for GitHub Copilot Chat |
 | **MCP Agent** | `services/mcp-agent` | Optional autonomous character controller (no Copilot required) |
+| **OpenAI Agent** | `services/openai-agent` | Optional Node.js autonomous controller powered by OpenAI model decisions |
 | **Mobile Expo** | `apps/mobile-expo` | React Native + Three.js 3D world for iOS/Android |
 
 ## Prerequisites
@@ -52,6 +53,26 @@ Open [http://localhost:8787](http://localhost:8787) — you'll see the landing p
    - Click **Save Active Scene**
 
 ✅ Your world is now ready for three types of clients: mobile, web, and AI.
+
+---
+
+## 🤖 OpenAI Node.js Agent (Model-Controlled Fighter)
+
+Run an autonomous fighter that reads world state, asks an OpenAI model what to do, and executes `move_to`, `attack`, and `say` commands with server-safe payloads.
+
+```bash
+# Terminal 2
+OPENAI_API_KEY=sk-... \
+OPENAI_MODEL=gpt-4.1-mini \
+pnpm run dev:openai-agent
+```
+
+Optional environment variables:
+- `CHARACTER_ID` — force a specific character id to control/spawn
+- `TICK_MS` — decision interval (default `1800`)
+- `AUTO_SPAWN` — auto-spawn controlled actor if missing (`true` by default)
+- `ALLOW_SAY` — allow in-character chat output (`true` by default)
+- `SAY_EVERY_N_TICKS` — chat cadence (default `4`)
 
 ---
 
