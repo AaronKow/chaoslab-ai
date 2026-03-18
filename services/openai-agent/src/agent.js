@@ -84,14 +84,10 @@ async function request(path, options = {}) {
 async function ensureSession() {
   if (sessionId) return sessionId;
 
-  const response = await request("/session/start", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ deviceId: DEVICE_ID }),
-  });
+  const response = await request("/api/session/shared");
 
   if (!response.ok || !response.body?.sessionId) {
-    throw new Error(`Failed to start session: ${response.status} ${JSON.stringify(response.body)}`);
+    throw new Error(`Failed to start shared session: ${response.status} ${JSON.stringify(response.body)}`);
   }
 
   sessionId = response.body.sessionId;
@@ -350,7 +346,37 @@ async function askModelForAction(worldSummary) {
     body: JSON.stringify({
       model: OPENAI_MODEL,
       input,
-      max_output_tokens: 512,
+      // Prevent hidden reasoning from consuming all tokens on small models.
+      reasoning: { effort: "minimal" },
+      text: {
+        format: {
+          type: "json_schema",
+          name: "fighter_action",
+          strict: true,
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              action: { type: "string", enum: ["move_to", "attack", "say", "idle"] },
+              position: {
+                anyOf: [
+                  {
+                    type: "array",
+                    minItems: 3,
+                    maxItems: 3,
+                    items: { type: "number" },
+                  },
+                  { type: "null" },
+                ],
+              },
+              text: { anyOf: [{ type: "string" }, { type: "null" }] },
+              reason: { type: "string" },
+            },
+            required: ["action", "position", "text", "reason"],
+          },
+        },
+      },
+      max_output_tokens: 1024,
     }),
   });
 
@@ -368,7 +394,9 @@ async function askModelForAction(worldSummary) {
   const text = extractResponseText(body);
   const parsed = tryParseJson(text);
   if (!parsed) {
-    throw new Error(`Model returned non-JSON output: ${text || "<empty>"}`);
+    throw new Error(
+      `Model returned non-JSON output: ${text || "<empty>"}; status=${safeText(body?.status, "unknown")}`,
+    );
   }
   return parsed;
 }
