@@ -127,6 +127,7 @@ async function postControl(session, command) {
 
 function resolveSelfActor(world, context) {
   const actors = Array.isArray(world?.actors) ? world.actors : [];
+  const preferredModelName = safeText(context?.scene?.activeModel);
 
   if (selfActorId) {
     const existing = actors.find((actor) => actor.actorId === selfActorId);
@@ -135,7 +136,13 @@ function resolveSelfActor(world, context) {
 
   const preferredCharacterId = safeText(CHARACTER_ID) || safeText(context?.scene?.activeCharacter?.id);
   if (preferredCharacterId) {
-    const byCharacter = actors.find((actor) => safeText(actor.characterId) === preferredCharacterId);
+    const byCharacter = preferredModelName
+      ? actors.find(
+          (actor) =>
+            safeText(actor.characterId) === preferredCharacterId &&
+            safeText(actor.modelName) === preferredModelName,
+        )
+      : actors.find((actor) => safeText(actor.characterId) === preferredCharacterId);
     if (byCharacter) {
       selfActorId = byCharacter.actorId;
       return byCharacter;
@@ -173,11 +180,13 @@ function findNearestOpponent(world, actorId, selfPosition) {
 
 async function spawnActor(session, context) {
   const preferredCharacterId = safeText(CHARACTER_ID) || safeText(context?.scene?.activeCharacter?.id);
+  const preferredModelName = safeText(context?.scene?.activeModel);
 
   if (preferredCharacterId) {
     const response = await postControl(session, {
       type: "spawn",
       payload: {
+        modelName: preferredModelName,
         characterId: preferredCharacterId,
         name: context?.scene?.activeCharacter?.name || preferredCharacterId,
         role: context?.scene?.activeCharacter?.role || "fighter",
