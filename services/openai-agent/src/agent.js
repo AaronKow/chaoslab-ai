@@ -25,6 +25,7 @@ const AUTO_SPAWN = process.env.AUTO_SPAWN !== "false";
 const ALLOW_SAY = process.env.ALLOW_SAY !== "false";
 const SAY_EVERY_N_TICKS = Math.max(1, Number(process.env.SAY_EVERY_N_TICKS || 4));
 const MAX_MEMORY_EVENTS = Math.max(6, Number(process.env.MAX_MEMORY_EVENTS || 24));
+const REUSE_EXISTING_ACTOR = process.env.REUSE_EXISTING_ACTOR === "true";
 
 const ATTACK_RANGE = 2.2;
 
@@ -132,6 +133,10 @@ function resolveSelfActor(world, context) {
   if (selfActorId) {
     const existing = actors.find((actor) => actor.actorId === selfActorId);
     if (existing) return existing;
+  }
+
+  if (!REUSE_EXISTING_ACTOR) {
+    return null;
   }
 
   const preferredCharacterId = safeText(CHARACTER_ID) || safeText(context?.scene?.activeCharacter?.id);
@@ -412,11 +417,18 @@ async function askModelForAction(worldSummary) {
 
 function sanitizeAction(rawAction, selfActor, nearestOpponent, distance, tick) {
   const action = safeText(rawAction?.action).toLowerCase();
+  const shouldSayThisTick = ALLOW_SAY && tick % SAY_EVERY_N_TICKS === 0;
+
+  if (shouldSayThisTick) {
+    const fallbackLine = !nearestOpponent
+      ? "I am searching for opponents."
+      : distance <= ATTACK_RANGE
+        ? "[action:defend] You are done."
+        : "I am coming for you.";
+    return { action: "say", text: safeText(rawAction?.text, fallbackLine) };
+  }
 
   if (!nearestOpponent) {
-    if (action === "say" && ALLOW_SAY && tick % SAY_EVERY_N_TICKS === 0) {
-      return { action: "say", text: safeText(rawAction?.text, "I am searching for opponents.") };
-    }
     const roam = clampPosition([
       Number(selfActor.position?.[0] || 0) + (Math.random() * 4 - 2),
       0,
@@ -426,14 +438,7 @@ function sanitizeAction(rawAction, selfActor, nearestOpponent, distance, tick) {
   }
 
   if (distance <= ATTACK_RANGE) {
-    if (action === "say" && ALLOW_SAY && tick % SAY_EVERY_N_TICKS === 0) {
-      return { action: "say", text: safeText(rawAction?.text, "[action:defend] You are done.") };
-    }
     return { action: "attack", reason: "Opponent in range" };
-  }
-
-  if (action === "say" && ALLOW_SAY && tick % SAY_EVERY_N_TICKS === 0) {
-    return { action: "say", text: safeText(rawAction?.text, "I am coming for you.") };
   }
 
   if (action === "move_to" && Array.isArray(rawAction?.position)) {
